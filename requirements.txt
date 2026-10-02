@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+google-genai>=1.9.0
+edge-tts>=6.1.9
+gTTS>=2.5.0
+mutagen>=1.46
+numpy>=1.26
+Pillow>=10.0
+python-multipart>=0.0.9
+requests>=2.31
