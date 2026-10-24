@@ -18,7 +18,7 @@ function h(tag, attrs = {}, ...kids) {
     else if (k === "disabled") el.disabled = !!v;
     else el.setAttribute(k, v);
   }
-  for (const kid of kids.flat()) {
+  for (const kid of kids.flat(Infinity)) {
     if (kid === null || kid === undefined || kid === false) continue;
     el.append(kid.nodeType ? kid : document.createTextNode(kid));
   }
@@ -247,7 +247,7 @@ async function viewHome() {
 
   const list = h("section", {}, [
     h("div", { class: "section-head" }, [h("h2", { text: "Your projects" })]),
-    projects.length ? projects.map(projectCard) : h("div", { class: "card muted", text: "No projects yet — build your first one above." }),
+    ...(projects.length ? projects.map(projectCard) : [h("div", { class: "card muted", text: "No projects yet — build your first one above." })]),
   ]);
   view.append(hero, list);
 }
