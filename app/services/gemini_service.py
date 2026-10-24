@@ -1,37 +1,270 @@
-"""Gemini integration: script engine, scene director, SFX planner.
-
-Model names come from Settings so the app keeps working as Google changes
-model availability — no hard-coded dependencies on specific versions.
+"""Gemini-side text helpers: script generation / revision, visual prompts,
+SFX line tagging, timeline planning, plus the Settings ☤ 'Test X' probes.
+Text can freely route through OpenRouter (free models) — Settings → Text provider.
 """
 from __future__ import annotations
 
 import json
 import re
 
-from ..config import DENSITIES
+from app.services import openrouter_service
 
-SAMPLE_TRANSCRIPT = """
-Music is so universal that scientists have found it in every human culture ever
-studied. But when did it actually begin? In 1995, archaeologists digging in a
-cave in Slovenia found something extraordinary: a small flute carved from the
-femur of a cave bear, dated to around 50,000 years ago. That means Neanderthals
-— not even modern humans — may have been making music. Some researchers argue
-the holes were made by animal teeth, and the debate still rages today. But the
-story gets stranger. A bone flute found in Germany's Hohle Fels cave, made from
-a vulture's wing bone, is over 40,000 years old and can still be played. Early
-humans didn't just make music for fun. Rhythmic sound helped groups coordinate
-work, remember stories before writing existed, and bond emotionally. Some
-scientists believe music may even predate language itself — that we sang before
-we spoke. And here's the twist: your brain treats music unlike almost any other
-stimulus. It activates the same reward circuits as food and affection, releasing
-dopamine even when a song just *anticipates* a drop. Every culture invents
-instruments, every baby responds to lullabies, and every era thinks its music is
-the best ever made. From a cave bear flute in the Stone Age to stadium
-concerts today, the strange history of music is really the history of us.
-"""
+# ------------------------------------------------------------------ styles
+NARRATION_STYLES = {
+    "documentary": "Serious, informative documentary tone; measured pacing, precise facts.",
+    "storytime": "Warm, friendly 'story time' storytelling — personal, engaging, a bit whimsical.",
+    "kids": "Simple words, bouncy energy, short sentences, playful questions (children's story).",
+    "newsreel": "Fast, crisp vintage 'newsreel announcer' cadence with punchy headlines.",
+    "mystery": "Hushed, suspenseful true-crime/mystery narration with dramatic pauses and reveals.",
+    "advert": "Upbeat, punchy commercial voice — big energy, key words emphasised.",
+    "audiobook": "Steady, intimate audiobook narration — even pace, subtle character colouring.",
+    "podcast": "Relaxed, conversational podcast host — natural rhythm, occasional asides.",
+}
+
+SYSTEM_BASE = (
+    "You write YouTube narration scripts that are spoken aloud by text-to-speech. "
+    "Write as continuous spoken prose (NO stage directions, NO brackets, NO markdown, "
+    "NO scene numbers) unless asked otherwise. Sentences should sound natural when read. "
+    "Language is English unless the user explicitly requests another. "
+    "Never invent statistics; if unsure, stay qualitative."
+)
 
 
-# ------------------------------------------------------------------ helpers
+# ------------------------------------------------------------- client utils
+def _use_openrouter(settings: dict) -> bool:
+    return (settings.get("text_provider") or "gemini").lower() == "openrouter"
+
+
+def _models_from_settings(settings: dict) -> dict:
+    return {"text": (settings.get("text_model") or "gemini-2.0-flash").strip(),
+            "or_text": (settings.get("openrouter_text_model") or "openrouter/free").strip()}
+
+
+def _gen_text(system: str, user: str, settings: dict, temperature: float = 0.8,
+              max_tokens: int = 8192) -> str:
+    if _use_openrouter(settings):
+        return openrouter_service.chat(settings, _models_from_settings(settings)["or_text"],
+                                       system, user, temperature, max_tokens)
+    from google import genai
+    from google.genai import types
+    key = (settings.get("gemini_api_key") or "").strip()
+    if not key:
+        raise RuntimeError(
+            "Gemini API key missing — set it in Settings, or switch Text provider to "
+            "OpenRouter (free models; key from openrouter.ai/keys).")
+    client = genai.Client(api_key=key)
+    try:
+        resp = client.models.generate_content(
+            model=_models_from_settings(settings)["text"],
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system, temperature=temperature, max_output_tokens=max_tokens),
+        )
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "429" in msg or "quota" in msg.lower():
+            raise RuntimeError(
+                "Gemini free text quota hit (HTTP 429) — wait a bit, or switch Text provider to "
+                "OpenRouter's free models in Settings.") from e
+        if "404" in msg or "not found" in msg.lower():
+            raise RuntimeError(
+                f"Gemini has no model '{_models_from_settings(settings)['text']}' — press "
+                "🔍 Browse models in Settings and pick an id that exists.") from e
+        raise RuntimeError(f"Gemini text failed: {msg[:300]}") from e
+    return (resp.text or "").strip()
+
+
+# ---------------------------------------------------------------- scripts
+def generate_script(topic: str, minutes: float, fmt: str, style: str,
+                    settings: dict, notes: str = "") -> str:
+    style_desc = NARRATION_STYLES.get(style, NARRATION_STYLES["documentary"])
+    target_words = int(minutes * 150)
+    ratio = "vertical 9:16 (Short/TikTok)" if fmt == "9:16" else "widescreen 16:9"
+    user = (
+        f"Write a complete spoken narration script for a {minutes:.1f}-minute {ratio} YouTube video.\n"
+        f"Topic: {topic}\n"
+        f"Narration style: {style} — {style_desc}\n"
+        f"Target length: about {target_words} words (150 words/min rule of thumb).\n"
+        "Structure it as a gripping opening hook, clearly sequenced body, and a strong closing beat. "
+        "No titles, no headings — spoken prose only.\n"
+    )
+    if notes.strip():
+        user += f"Extra instructions from the creator:\n{notes}\n"
+    out = _gen_text(SYSTEM_BASE, user, settings, temperature=0.85)
+    return re.sub(r"\[.*?\]|\(.*?\)", "", out).strip()  # strip any sneaked-in stage directions
+
+
+def revise_script(script: str, instruction: str, style: str, settings: dict) -> str:
+    user = (
+        f"Here is an existing YouTube narration script:\n\n{script}\n\n"
+        f"Revise it per this instruction: {instruction}\n"
+        f"Keep the {style} narrative style. Return ONLY the revised script as spoken prose."
+    )
+    out = _gen_text(SYSTEM_BASE, user, settings, temperature=0.7)
+    return re.sub(r"\[.*?\]|\(.*?\)", "", out).strip()
+
+
+def split_into_shots(script: str, max_shots: int, settings: dict) -> list[str]:
+    """Split narration into visual beats, capped by the density cap. Falls back
+    to a deterministic sentence-group split if the model drifts."""
+    user = (
+        "You are breaking a narration script into visual 'shots' — each shot is a piece of narration "
+        "that works while ONE still image is on screen with a slow pan/zoom.\n"
+        "Rules: keep EVERY word of the script, in order; do not rewrite; group 1–3 sentences per shot; "
+        f"return AT MOST {max_shots} shots as a JSON array of strings.\n"
+        "Script:\n" + script
+    )
+    out = _gen_text(SYSTEM_BASE, user, settings, temperature=0.2, max_tokens=8192)
+    shots = _parse_json_array(out)
+    if not shots:
+        shots = _deterministic_split(script, max_shots)
+    shots = [s.strip() for s in shots if str(s).strip()][:max_shots]
+    if not shots:
+        shots = [script]
+    return shots
+
+
+def _deterministic_split(script: str, max_shots: int) -> list[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", script.strip())
+    if len(sentences) <= max_shots:
+        return [s for s in sentences if s]
+    per = max(1, len(sentences) // max_shots)
+    shots = [" ".join(sentences[i:i + per + 1]) for i in range(0, len(sentences), per + 1)]
+    return [s for s in shots if s][:max_shots]
+
+
+def visual_prompt(shot_text: str, bible: dict, settings: dict) -> str:
+    style_line = (f"Style: {bible.get('style')}; line: {bible.get('linework')}; "
+                  f"faces: {bible.get('faces')}; color: {bible.get('color')}; "
+                  f"background: {bible.get('background')}; composition: {bible.get('composition')}.")
+    neg = bible.get("negative") or ""
+    chars = "; ".join(f"{c.get('name')}: {c.get('description')}" for c in bible.get("characters", []))
+    user = (
+        "Write a single concise image-generation prompt (max 70 words) for the image that should "
+        "sit under this narration beat:\n" + shot_text + "\n"
+        + style_line + (f"\nCast: {chars}." if chars else "")
+        + f"\nAvoid: {neg}." if neg else ""
+    )
+    prompt = _gen_text("You write image-generation prompts.", user, settings,
+                       temperature=0.5, max_tokens=200)
+    return prompt.strip().strip('"')
+
+
+def improve_visual_prompt(prompt: str, bible: dict, settings: dict) -> str:
+    user = (
+        "Improve this image prompt for clearer composition and stronger storybook appeal, "
+        "in at most 80 words. Keep the core subject identical. Style constraints:\n"
+        f"{bible.get('style')}, {bible.get('linework')}, {bible.get('color')}.\n"
+        f"Current prompt: {prompt}"
+    )
+    return _gen_text("You improve image prompts.", user, settings, temperature=0.6, max_tokens=256).strip()
+
+
+def tag_sfx_beats(script: str, sfx_catalog: list[str], settings: dict,
+                  max_tags: int = 12) -> list[dict]:
+    """Return [{"cue_index": int, "sfx": "filename", "volume": 0-1}] – keeps dry
+    when no catalog is available."""
+    if not sfx_catalog:
+        return []
+    catalog = "\n".join(f"- {s}" for s in sfx_catalog[:80])
+    user = (
+        "Mark sound-effect cues in this narration script. Return JSON list of objects "
+        '{"cue_index": n, "sfx": "filename", "volume": 0.0-1.0} where cue_index is the '
+        f"0-based sentence index where the sound starts. Use only files from this library, "
+        f"max {max_tags} cues, and only where a cue truly adds punch:\n{catalog}\n\nScript:\n{script}"
+    )
+    out = _gen_text(SYSTEM_BASE, user, settings, temperature=0.3, max_tokens=2048)
+    data = _parse_json(out) or []
+    return [d for d in data if isinstance(d, dict) and d.get("sfx") in sfx_catalog][:max_tags]
+
+
+def test_text(settings: dict) -> str:
+    out = _gen_text(SYSTEM_BASE, "Reply with exactly: READY", settings, temperature=0.0, max_tokens=8)
+    prov = "OpenRouter" if _use_openrouter(settings) else "Gemini"
+    model = _models_from_settings(settings)["or_text" if _use_openrouter(settings) else "text"]
+    return f"OK — {prov} model '{model}' responded: {out[:40] or '(empty reply)'}"
+
+
+def test_image(settings: dict) -> str:
+    from . import image_service
+    data = image_service.generate_image(
+        "A simple smiley face doodle, black outline on white background",
+        settings, fmt="16:9", ref_paths=[])
+    return f"OK — received {len(data) // 1024} KB image"
+
+
+def test_tts(settings: dict, tmp_dir) -> str:
+    from . import tts_service
+    out = tmp_dir / "tts_test"
+    info = tts_service.synth_beat("StickStory Studio voice test, one two three.",
+                                  out, {**settings, "mock_mode": False})
+    f = tmp_dir / info["file"]
+    dur = tts_service.measure_duration(f)
+    if not f.exists() or dur <= 0:
+        raise RuntimeError("TTS produced no audio")
+    f.unlink(missing_ok=True)
+    return f"OK — {info['provider']} produced {dur:.1f}s of audio"
+
+
+def list_available_models(settings: dict) -> dict:
+    """Report which text models are reachable for the Settings browser."""
+    report: dict = {"provider": "openrouter" if _use_openrouter(settings) else "gemini",
+                    "models": []}
+    if _use_openrouter(settings):
+        try:
+            catalog = openrouter_service.list_models(settings)
+            cls = openrouter_service.classify(catalog)
+            report["models"] = cls["text_free"][:30] + cls["text_paid"][:20]
+            report["counts"] = {"total": cls["count"],
+                                "free": len(cls["text_free"]),
+                                "image": len(cls["image"])}
+            report["image_models"] = cls["image"][:20]
+        except Exception as e:  # noqa: BLE001
+            report["error"] = str(e)
+    else:
+        key = (settings.get("gemini_api_key") or "").strip()
+        if not key:
+            report["error"] = "No Gemini key set"
+        else:
+            try:
+                from google import genai
+                client = genai.Client(api_key=key)
+                names = [m.name.replace("models/", "") for m in client.models.list()]
+                report["models"] = [n for n in names if "gemini" in n][:40]
+            except Exception as e:  # noqa: BLE001
+                report["error"] = str(e)
+    return report
+
+
+# --------------------------------------------------------------- json utils
+def _parse_json(raw: str):
+    m = re.search(r"[\[{].*[\]}]", raw, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _parse_json_array(raw: str) -> list | None:
+    v = _parse_json(raw)
+    return v if isinstance(v, list) else None
+
+
+# ==================================================== workflow-engine API
+# Structured-JSON helpers required by app/services/workflow.py (script
+# generation from a source transcript, sfx planning, mock variants).
+
+SAMPLE_TRANSCRIPT = """Welcome back to the channel. Today we are looking at why tiny daily habits
+beat big once-a-year resolutions. Researchers tracked two groups for a year:
+one set huge January goals, the other committed to two-minute daily actions.
+After twelve months the daily group outperformed on every measure — reading,
+fitness, savings. The reason is friction: big goals demand motivation every
+time, tiny habits sneak under it. We will cover the two-minute rule, habit
+stacking, and the comeback plan for missed days."""
+
+
 def get_client(settings: dict):
     from google import genai
     key = (settings.get("gemini_api_key") or "").strip()
@@ -54,7 +287,16 @@ def extract_json(text: str):
     raise ValueError(f"Model did not return valid JSON: {t[:200]}")
 
 
-def _gen_json(client, model: str, prompt: str, temperature: float = 0.8):
+def _gen_json_text(prompt: str, settings: dict, temperature: float = 0.8):
+    """JSON generation routed through the configured text provider."""
+    if _use_openrouter(settings):
+        raw = openrouter_service.chat(
+            settings, _models_from_settings(settings)["or_text"],
+            "You answer ONLY with strict JSON — no prose, no markdown fences.",
+            prompt, temperature=temperature, max_tokens=8192)
+        return extract_json(raw)
+    client = get_client(settings)
+    model = (settings.get("text_model") or "gemini-2.0-flash").strip()
     from google.genai import types
     try:
         resp = client.models.generate_content(
@@ -62,7 +304,6 @@ def _gen_json(client, model: str, prompt: str, temperature: float = 0.8):
             config=types.GenerateContentConfig(response_mime_type="application/json",
                                                temperature=temperature))
     except Exception:
-        # Some models/SDK combos reject response_mime_type — retry plainly.
         resp = client.models.generate_content(model=model, contents=prompt)
     return extract_json(getattr(resp, "text", "") or "")
 
@@ -83,72 +324,41 @@ def style_block(bible: dict) -> str:
     )
 
 
-# ------------------------------------------------------------------ script
 def build_script_prompt(transcript: str, opts: dict, bible: dict) -> str:
-    fmt = opts.get("format", "16:9")
-    minutes = float(opts.get("target_length_min", 8))
-    density = DENSITIES.get(opts.get("density", "normal"), DENSITIES["normal"])
-    total_secs = int(minutes * 60)
-    wpm = 165 if fmt == "16:9" else 180
-    target_words = int(minutes * wpm)
-    n_beats = max(3, min(density["cap"], round(total_secs / density["secs"])))
-    words_per_beat = max(12, round(target_words / n_beats))
-    shorts = fmt == "9:16"
+    from app import config as _cfg
+    dens = _cfg.DENSITIES.get(opts.get("density") or "normal", _cfg.DENSITIES["normal"])
+    fmt = "vertical 9:16 (YouTube Short/TikTok)" if opts.get("format") == "9:16" else "widescreen 16:9"
+    style = bible.get("style_name") or "Storybook Stick"
+    narr_style = opts.get("narration_style") or "documentary"
+    narr = NARRATION_STYLES.get(narr_style, NARRATION_STYLES["documentary"])
+    return f"""You are writing a narrated YouTube video script WITH matching visuals.
 
-    if opts.get("script_mode") == "clone":
-        task = (
-            "Rewrite the reference transcript into a NEW narrated video script that follows its "
-            "beat-by-beat structure, pacing and hook pattern closely, but rewords everything in "
-            "original language so it is not a copy. Keep the same topic and factual spine."
-        )
-    else:
-        task = (
-            "Use the reference transcript ONLY as research. Extract its topic, hook, structural "
-            "beats and key claims, then independently write an original narrated video treatment "
-            "on the same subject with a fresh angle, new examples where possible, and none of "
-            "the original sentences. Do NOT paraphrase line-by-line."
-        )
-
-    return f"""You are the head writer and scene director for a YouTube channel that makes
-{"short-form vertical (YouTube Shorts)" if shorts else "long-form"} educational videos with
-2D storybook stick-character animations.
-
-REFERENCE TRANSCRIPT (source material):
+SOURCE MATERIAL (adapt faithfully — never invent competing facts):
 \"\"\"
-{transcript.strip()[:12000]}
+{transcript[:12000]}
 \"\"\"
 
-TASK:
-{task}
+FORMAT: {fmt}. Target length: {opts.get('target_length_min', 5)} minutes of narration
+(~{int(float(opts.get('target_length_min', 5)) * 150)} spoken words total).
+NARRATION STYLE: {narr_style} — {narr}
+PACING: {dens['label']} — split into at most {dens['cap']} beats.
 
-Hard requirements:
-- Write for the ear: conversational hook in the first sentence, open loops, curiosity gaps,
-  signposting, short punchy sentences. No stage directions, no headers — pure narration.
-- Total narration ≈ {target_words} words (~{minutes:g} minutes at {wpm} wpm).
-- Split the narration into ABOUT {n_beats} numbered beats of roughly {words_per_beat} words each.
-  Each beat = one visual moment (the image changes when the beat changes).
-- For every beat, write a 'visual': a precise image-generation prompt describing ONE clear scene
-  with the recurring characters, matching the art bible below, plus relevant environment, props,
-  lighting and emotion. One scene per beat, strong focal action, vary camera distance/angle across
-  beats. No text/words rendered inside images unless a comic symbol is essential.
-- Also list up to 6 factual claims in 'fact_check' that the creator should verify before publishing.
+For EVERY beat output: (1) 'narration' = the exact spoken text for that beat
+(1-3 natural sentences, continuous prose, no directions), (2) 'visual' = a
+concrete description of what the illustration shows while it is spoken.
 
 {style_block(bible)}
 
-Return ONLY JSON of exactly this shape:
-{{
-  "title": "clickable video title",
-  "description": "2-3 sentence YouTube description with a soft CTA",
-  "tags": ["up to 12 search tags"],
-  "fact_check": ["claim worth verifying"],
-  "beats": [{{"narration": "exact spoken words for this beat", "visual": "image prompt"}}]
-}}"""
+Also produce: 'title' (clickable, honest), 'description' (2-3 sentences +
+hashtags), 'tags' (up to 12), 'fact_check' (up to 6 claims a creator should verify).
+
+Return ONLY JSON:
+{{"title": "...", "description": "...", "tags": [...], "fact_check": [...],
+  "beats": [{{"narration": "...", "visual": "..."}}, ...]}}"""
 
 
-def generate_script(transcript: str, opts: dict, bible: dict, settings: dict) -> dict:
-    client = get_client(settings)
-    data = _gen_json(client, settings.get("text_model", "gemini-2.5-flash"),
-                     build_script_prompt(transcript, opts, bible))
+def generate_script(transcript: str, opts: dict, bible: dict, settings: dict) -> dict:  # noqa: F811
+    data = _gen_json_text(build_script_prompt(transcript, opts, bible), settings)
     return _normalize_script(data)
 
 
@@ -173,50 +383,31 @@ def _normalize_script(data: dict) -> dict:
 
 def generate_script_mock(transcript: str, opts: dict, bible: dict) -> dict:
     src = (transcript or SAMPLE_TRANSCRIPT).strip()
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", src) if len(s.strip()) > 2]
-    if not sents:
-        sents = [src]
-    density = DENSITIES.get(opts.get("density", "normal"), DENSITIES["normal"])
-    minutes = float(opts.get("target_length_min", 8))
-    n_beats = min(len(sents), max(3, min(density["cap"], round(minutes * 60 / density["secs"]))))
-    n_beats = min(n_beats, 12)  # mock stays small & fast
-    chunks = [[] for _ in range(n_beats)]
-    for i, s in enumerate(sents):
-        chunks[min(n_beats - 1, i * n_beats // len(sents))].append(s)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", src) if s.strip()]
+    from app import config as _cfg
+    dens = _cfg.DENSITIES.get(opts.get("density") or "normal", _cfg.DENSITIES["normal"])
+    cap = min(dens["cap"], max(4, len(sentences)))
+    per = max(1, len(sentences) // cap)
     beats = []
-    for i, chunk in enumerate(chunks):
-        narration = " ".join(chunk) or sents[i % len(sents)]
-        kw = " ".join(w.strip(".,!?") for w in narration.split()[:7])
+    for i in range(0, len(sentences), per):
+        group = " ".join(sentences[i:i + per + 1])
         beats.append({
-            "id": f"b{i + 1:03d}",
-            "narration": narration,
-            "visual": f"Storybook stick-character scene illustrating: {kw}… — simple 2D cartoon, muted warm palette",
+            "narration": group,
+            "visual": f"A storybook stick-figure scene illustrating: {group[:90]}",
         })
-    return {
-        "title": " ".join(src.split()[:6]).title().strip(".,!") + " — Explained",
-        "description": "A mock-generated script (demo mode). Turn off Mock mode and add a Gemini key for real writing.",
-        "tags": ["demo", "mock", "storybook"],
-        "fact_check": ["These dates/claims came from the source transcript — verify before publishing."],
+        if len(beats) >= cap:
+            break
+    return _normalize_script({
+        "title": "Tiny Habits, Big Results (Demo)",
+        "description": "A mocked demo script — turn off Mock mode and add a key for the real thing. #demo",
+        "tags": ["demo", "habits", "storybook"],
+        "fact_check": ["Demo content — no real claims."],
         "beats": beats,
-    }
-
-
-# ------------------------------------------------------------------ misc AI
-def improve_visual_prompt(beat_narration: str, current: str, bible: dict, settings: dict) -> str:
-    client = get_client(settings)
-    prompt = f"""Rewrite this storyboard image prompt so it better matches the narration and the art bible.
-Keep it a single scene, specific, visual, under 80 words. Return ONLY JSON: {{"visual": "..."}}
-
-NARRATION: {beat_narration}
-CURRENT PROMPT: {current or '(none)'}
-{style_block(bible)}"""
-    data = _gen_json(client, settings.get("text_model", "gemini-2.5-flash"), prompt, temperature=0.9)
-    return (data.get("visual") or current).strip()
+    })
 
 
 def generate_sfx_plan(beats: list[dict], timeline: list[dict], settings: dict) -> list[dict]:
     """AI decides where sound effects should land. Returns cue dicts."""
-    client = get_client(settings)
     listing = "\n".join(
         f"Scene {i + 1} [{t['start']:.2f}s–{t['end']:.2f}s]: {b['narration'][:140]}"
         for i, (b, t) in enumerate(zip(beats, timeline)))
@@ -231,8 +422,7 @@ SCENES:
 
 Return ONLY JSON: {{"cues": [{{"scene": 1, "offset": 0.0, "name": "whoosh", "description": "transition"}}]}}
 where offset is seconds after the scene start."""
-
-    data = _gen_json(client, settings.get("text_model", "gemini-2.5-flash"), prompt, temperature=0.6)
+    data = _gen_json_text(prompt, settings, temperature=0.6)
     cues = []
     for c in (data.get("cues") or [])[:60]:
         try:
@@ -265,32 +455,3 @@ def generate_sfx_plan_mock(beats: list[dict], timeline: list[dict]) -> list[dict
             cues.append({"beat": i + 1, "offset": 0.2, "name": ambient_pool[(i // 4) % 3],
                          "source": "procedural", "description": "scene ambience", "gain": 0.35})
     return cues[:40]
-
-
-# ------------------------------------------------------------------ tests
-def test_text(settings: dict) -> str:
-    client = get_client(settings)
-    model = settings.get("text_model", "gemini-2.5-flash")
-    data = _gen_json(client, model, 'Return ONLY JSON: {"ok": true, "model": "' + model + '"}')
-    return f"OK — {model} responded"
-
-
-def test_image(settings: dict) -> str:
-    from . import image_service
-    data = image_service.generate_image(
-        "A simple smiley face doodle, black outline on white background",
-        settings, fmt="16:9", ref_paths=[])
-    return f"OK — received {len(data) // 1024} KB image"
-
-
-def test_tts(settings: dict, tmp_dir) -> str:
-    from . import tts_service
-    out = tmp_dir / "tts_test"
-    info = tts_service.synth_beat("StickStory Studio voice test, one two three.",
-                                  out, {**settings, "mock_mode": False})
-    f = tmp_dir / info["file"]
-    dur = tts_service.measure_duration(f)
-    if not f.exists() or dur <= 0:
-        raise RuntimeError("TTS produced no audio")
-    f.unlink(missing_ok=True)
-    return f"OK — {info['provider']} produced {dur:.1f}s of audio"

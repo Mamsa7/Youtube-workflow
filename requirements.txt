@@ -8,3 +8,5 @@ numpy>=1.26
 Pillow>=10.0
 python-multipart>=0.0.9
 requests>=2.31
+gradio_client
+pytest>=8.0

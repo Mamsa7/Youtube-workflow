@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -55,7 +55,9 @@ def health():
 # ------------------------------------------------------------------ settings
 @app.get("/api/settings")
 def get_settings():
-    return _ok(config.get_settings())
+    # secrets leave the server ONLY masked — the key material never crosses
+    # to the browser, whether Gemini's, ElevenLabs', or VoiceStudio's.
+    return _ok(config.get_settings(public=True))
 
 
 @app.put("/api/settings")
@@ -63,11 +65,16 @@ def put_settings(payload: dict = Body(...)):
     return _ok(config.save_settings(payload))
 
 
+@app.get("/api/settings/models")
+def list_models():
+    return _ok(gemini_service.list_available_models(config.get_settings()))
+
+
 @app.post("/api/settings/test")
 def test_connection(payload: dict = Body(...)):
     service = payload.get("service")
     settings = config.get_settings()
-    if settings.get("mock_mode") and service != "mock":
+    if settings.get("mock_mode") and service not in ("mock", "voicestudio"):
         return JSONResponse({"ok": False, "error": "Mock mode is ON — turn it off to test real APIs."},
                             status_code=400)
     try:
@@ -77,6 +84,12 @@ def test_connection(payload: dict = Body(...)):
             msg = gemini_service.test_image(settings)
         elif service == "tts":
             msg = gemini_service.test_tts(settings, config.DATA_DIR)
+        elif service == "voicestudio":
+            info = tts_service.voicestudio_discover(settings)
+            if not info.get("reachable"):
+                raise RuntimeError(f"No VoiceStudio answered at {info['url']} — is it running?")
+            msg = (f"OK — VoiceStudio {info.get('version') or ''} at {info['url']} · "
+                   f"{len(info.get('engines') or [])} engine(s), {len(info.get('voices') or [])} voice(s)")
         else:
             raise HTTPException(400, f"Unknown service '{service}'")
         return _ok(message=msg)
@@ -542,3 +555,99 @@ def export_draft(pid: str):
 def project_media(pid: str, rel: str):
     p = _safe_media(pid, rel)
     return FileResponse(p, headers={"Cache-Control": "no-cache"})
+
+
+# ================================================== v13: providers & models
+from .services import openrouter_service  # noqa: E402
+
+
+@app.get("/api/openrouter/models")
+def openrouter_models():
+    try:
+        s = config.get_settings()
+        catalog = openrouter_service.list_models(s)
+        return _ok(openrouter_service.classify(catalog))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.get("/api/leonardo/models")
+def leonardo_models():
+    try:
+        return _ok(image_service.list_leonardo_models(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.get("/api/pollinations/models")
+def pollinations_models():
+    try:
+        import requests
+        s = config.get_settings()
+        key = (s.get("pollinations_api_key") or "").strip()
+        r = requests.get("https://image.pollinations.ai/models",
+                         headers={"Authorization": f"Bearer {key}"} if key else {}, timeout=15)
+        if r.ok:
+            models = r.json()
+            if isinstance(models, list):
+                return _ok([m if isinstance(m, str) else m.get("name", str(m)) for m in models])
+    except Exception:
+        pass
+    return _ok(image_service.POLLINATIONS_MODELS)
+
+
+@app.get("/api/elevenlabs/voices")
+def elevenlabs_voices():
+    try:
+        return _ok(tts_service.list_elevenlabs_voices(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.get("/api/narration/styles")
+def narration_styles():
+    return _ok([{"id": k, "desc": v} for k, v in gemini_service.NARRATION_STYLES.items()])
+
+
+# ------------------------------------------------------------ VoiceStudio
+@app.get("/api/voicestudio/discover")
+def vs_discover():
+    try:
+        return _ok(tts_service.voicestudio_discover(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.get("/api/voicestudio/pronunciation")
+def vs_pronunciation_get():
+    try:
+        info = tts_service.voicestudio_discover(config.get_settings())
+        return _ok(info.get("pronunciation") or [])
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.post("/api/voicestudio/clone")
+async def vs_clone(name: str = Form(...), ref_text: str = Form(""),
+                   ref_audio: UploadFile = File(...)):
+    """User deliberately provides THEIR OWN voice sample; we register it as a
+    clone profile with the local VoiceStudio. Server-to-loopback only."""
+    import shutil
+    s = config.get_settings()
+    if not s.get("vs_license_ack"):
+        return JSONResponse({"ok": False, "error":
+            "VoiceStudio defaults to CC-BY-NC (non-commercial) OmniVoice weights. Tick the "
+            "acknowledgement in Settings → VoiceStudio before cloning/using voices."},
+            status_code=400)
+    tmp = config.DATA_DIR / "clone_uploads"
+    tmp.mkdir(exist_ok=True)
+    dest = tmp / f"{uuid.uuid4().hex[:8]}_{Path(ref_audio.filename or 'ref.wav').name}"
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(ref_audio.file, out)
+    try:
+        result = tts_service.voicestudio_clone_voice(name, dest, ref_text, s)
+    except Exception as e:  # noqa: BLE001
+        dest.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(e)[:500]}, status_code=400)
+    return _ok({"voice_id": result["id"],
+                "hint": "Paste this id into Settings → VoiceStudio voice profile id."})

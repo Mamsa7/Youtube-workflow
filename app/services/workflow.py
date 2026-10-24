@@ -23,6 +23,7 @@ def run_script(pid: str, progress, cancel) -> None:
         "target_length_min": p["target_length_min"],
         "density": p["density"],
         "script_mode": p["script_mode"],
+        "narration_style": p.get("narration_style") or settings.get("narration_style") or "documentary",
     }
     progress(0, 1, "Mock-writing script…" if settings.get("mock_mode")
              else f"Writing script with {settings.get('text_model')}…")
@@ -91,13 +92,19 @@ def run_voice(pid: str, progress, cancel) -> None:
         tts_service.concat_files([store.project_dir(pid) / vb["file"] for vb in voice_beats], full_path)
         full_rel = f"voice/{full_path.name}"
 
+    prov = settings.get("tts_provider")
+    voice_names = {
+        "edge-tts": settings.get("edge_voice"),
+        "gtts": f"gTTS ({settings.get('gtts_lang')})",
+        "elevenlabs": settings.get("elevenlabs_voice"),
+        "voicestudio": (settings.get("vs_voice_profile_id") or "").strip() or "VoiceStudio default",
+    }
     q = store.get_project(pid)
     q["voice"] = {
         "beats": voice_beats,
         "full": full_rel,
-        "provider": settings.get("tts_provider"),
-        "voice_name": settings.get("edge_voice") if settings.get("tts_provider") == "edge-tts"
-                      else settings.get("gtts_lang"),
+        "provider": prov,
+        "voice_name": voice_names.get(prov, settings.get("edge_voice")),
     }
     q["timeline"] = timeline
     q["captions"] = None

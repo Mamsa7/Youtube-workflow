@@ -55,6 +55,23 @@ function toast(msg, kind = "info", ms = 3800) {
   setTimeout(() => t.remove(), ms);
 }
 
+function modal(title, bodyKids, actionKids) {
+  modalClose();
+  const box = h("div", { class: "modal" }, [
+    h("div", { class: "modal-head" }, [
+      h("strong", { text: title }),
+      h("button", { class: "modal-x", text: "✕", onclick: () => modalClose() }),
+    ]),
+    h("div", { class: "modal-body" }, bodyKids),
+    h("div", { class: "modal-actions" }, actionKids),
+  ]);
+  const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) modalClose(); } }, box);
+  $("#modal-root").append(bg);
+  return box;
+}
+
+function modalClose() { $("#modal-root").replaceChildren(); }
+
 function fmtTime(s) {
   if (s === null || s === undefined) return "--:--";
   const m = Math.floor(s / 60), sec = s - m * 60;
@@ -911,81 +928,173 @@ async function viewSettings() {
   const voices = state.voices || (state.voices = await api("/api/voices"));
 
   view.append(h("h1", { text: "Settings" }),
-    h("p", { class: "muted", text: "Providers are fully model-configurable — when Google changes model availability, switch names here without any code changes. Keys are stored locally in ./data (never committed to git)." }));
+    h("p", { class: "muted", text: "Keys live only in ./data on this machine (never in git, never sent anywhere but the matching API). Secret fields show •••••• when a key is saved — leave them untouched to keep it, type a new value to replace." }));
 
-  /* gemini */
-  const keyInput = h("input", { type: "password", value: s.gemini_api_key || "", placeholder: "Google AI Studio API key" });
+  /* ---------------- TEXT ---------------- */
+  const gemKey = secInput("gemini_api_key", s.gemini_api_key, "Google AI Studio API key");
+  const orKey = secInput("openrouter_api_key", s.openrouter_api_key, "sk-or-… (openrouter.ai/keys)");
+  const textProv = h("select", { id: "text-provider" },
+    [["gemini", "Google Gemini (key from aistudio.google.com)"],
+     ["openrouter", "OpenRouter — incl. FREE models (key from openrouter.ai/keys)"]].map(([v, l]) =>
+      h("option", { value: v, text: l, ...(v === (s.text_provider || "gemini") ? { selected: true } : {}) })));
   const textModel = modelInput("model-text", s.text_model, ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"]);
+  const orTextModel = modelInput("model-ortext", s.openrouter_text_model, ["openrouter/free", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free", "deepseek/deepseek-r1:free"]);
+  const orBrowse = browseBtn("🔍 Browse OpenRouter models", async (out) => {
+    const d = await api("/api/openrouter/models");
+    out.textContent = `Catalog: ${d.count} models — ${d.text_free.length} free text, ${d.image.length} image.\nFREE text:\n  ${d.text_free.slice(0, 12).join("\n  ")}\nImage models:\n  ${d.image.slice(0, 8).join("\n  ")}`;
+  });
+
+  const styleSel = h("select", { id: "narr-style" },
+    [["documentary", "Documentary (serious)"], ["storytime", "Storytime (friendly)"],
+     ["kids", "Kids (bouncy)"], ["newsreel", "Newsreel (crisp)"],
+     ["mystery", "Mystery (hushed)"], ["advert", "Advert (punchy)"],
+     ["audiobook", "Audiobook (steady)"], ["podcast", "Podcast (relaxed)"]].map(([v, l]) =>
+      h("option", { value: v, text: l, ...(v === (s.narration_style || "documentary") ? { selected: true } : {}) })));
+
+  const textCard = h("section", { class: "card" }, [
+    h("h2", { text: "✍️ Script (text AI)" }),
+    h("div", { class: "grid2" }, [
+      h("label", { class: "field" }, [h("span", { text: "Text provider" }), textProv]),
+      h("label", { class: "field" }, [h("span", { text: "Narration style (script tone 🎭)" }), styleSel]),
+      h("label", { class: "field" }, [h("span", { text: "Gemini API key" }), gemKey]),
+      h("label", { class: "field" }, [h("span", { text: "Gemini text model" }), textModel.input, textModel.list]),
+      h("label", { class: "field" }, [h("span", { text: "OpenRouter API key" }), orKey]),
+      h("label", { class: "field" }, [h("span", { text: "OpenRouter text model + 🔍" }), orTextModel.input, orTextModel.list, orBrowse.btn]),
+    ]),
+    orBrowse.out,
+  ]);
+
+  /* ---------------- IMAGE ---------------- */
+  const imgBackend = h("select", { id: "img-backend" },
+    [["pollinations", "Pollinations — FREE (flux etc., free key required)"],
+     ["huggingface", "Hugging Face Inference — FREE token"],
+     ["hfspace", "HF Space (Qwen-Image 2.1) — FREE, queues ~30–90s"],
+     ["openrouter", "OpenRouter image models (some free)"],
+     ["gemini", "Gemini native image (paid tier only!)"],
+     ["imagen", "Imagen 3 (paid)"],
+     ["leonardo", "Leonardo AI (API plan, token)"]].map(([v, l]) =>
+      h("option", { value: v, text: l, ...(v === (s.image_backend || "pollinations") ? { selected: true } : {}) })));
+  const pollKey = secInput("pollinations_api_key", s.pollinations_api_key, "FREE key — enter.pollinations.ai/keys");
+  const pollModel = modelInput("model-poll", s.free_image_model, ["flux", "turbo", "gptimage"]);
+  const hfKey = secInput("hf_api_key", s.hf_api_key, "hf_… (hf.co/settings/tokens)");
+  const hfModel = modelInput("model-hf", s.hf_image_model, ["stabilityai/stable-diffusion-xl-base-1.0", "black-forest-labs/FLUX.1-schnell"]);
+  const hfSpace = h("input", { type: "text", id: "hf-space", value: s.hf_space_id || "Qwen/Qwen-Image-2.1", placeholder: "user/space (e.g. Qwen/Qwen-Image-2.1)" });
   const imgModel = modelInput("model-img", s.image_model, ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"]);
   const imagenModel = modelInput("model-imagen", s.imagen_model, ["imagen-3.0-generate-002", "imagen-4.0-generate-001"]);
-  const backendSel = h("select", { id: "img-backend" },
-    [["gemini", "Gemini native image (conversational, keeps character refs)"],
-     ["imagen", "Imagen (dedicated image model)"]].map(([v, l]) =>
-      h("option", { value: v, text: l, ...(v === s.image_backend ? { selected: true } : {}) })));
+  const orImgModel = modelInput("model-orimg", s.openrouter_image_model, ["google/gemini-2.5-flash-image-preview"]);
+  const leoKey = secInput("leonardo_api_key", s.leonardo_api_key, "Leonardo API key (cloud.leonardo.ai)");
+  const leoModel = h("input", { type: "text", id: "leo-model", value: s.leonardo_model_id || "", placeholder: "model id — press 🔍 Browse" });
+  const leoBrowse = browseBtn("🔍 Browse Leonardo models", async (out) => {
+    const d = await api("/api/leonardo/models");
+    out.textContent = "Your account sees:\n" + d.map(m => `  ${m.id}  ${m.name || ""}`).join("\n");
+  });
+  const pollBrowse = browseBtn("🔍 Pollinations model list", async (out) => {
+    const d = await api("/api/pollinations/models");
+    out.textContent = "Available: " + d.join(", ");
+  });
 
-  const geminiCard = h("section", { class: "card" }, [
-    h("h2", { text: "Google AI Studio (Gemini)" }),
-    h("label", { class: "field" }, [h("span", { text: "API key" }), keyInput]),
+  const imgCard = h("section", { class: "card" }, [
+    h("h2", { text: "🖼️ Images" }),
+    h("label", { class: "field" }, [h("span", { text: "Backend" }), imgBackend]),
     h("div", { class: "grid2" }, [
-      h("label", { class: "field" }, [h("span", { text: "Script / text model" }), textModel.input, textModel.list]),
-      h("label", { class: "field" }, [h("span", { text: "Image backend" }), backendSel]),
+      h("label", { class: "field" }, [h("span", { text: "Pollinations key (FREE)" }), pollKey]),
+      h("label", { class: "field" }, [h("span", { text: "Pollinations model (e.g. flux — NOT a 'user/space' id)" }), pollModel.input, pollModel.list, pollBrowse.btn]),
+      h("label", { class: "field" }, [h("span", { text: "Hugging Face token (FREE)" }), hfKey]),
+      h("label", { class: "field" }, [h("span", { text: "HF model id" }), hfModel.input, hfModel.list]),
+      h("label", { class: "field" }, [h("span", { text: "HF Space id (no key needed; first hit can queue ~90s — don't spam Test)" }), hfSpace]),
+      h("label", { class: "field" }, [h("span", { text: "OpenRouter image model" }), orImgModel.input, orImgModel.list]),
       h("label", { class: "field" }, [h("span", { text: "Gemini image model" }), imgModel.input, imgModel.list]),
       h("label", { class: "field" }, [h("span", { text: "Imagen model" }), imagenModel.input, imagenModel.list]),
+      h("label", { class: "field" }, [h("span", { text: "Leonardo key" }), leoKey]),
+      h("label", { class: "field" }, [h("span", { text: "Leonardo model id + 🔍" }), leoModel, leoBrowse.btn]),
     ]),
+    pollBrowse.out, leoBrowse.out,
   ]);
 
-  /* voice */
-  const providerSel = h("select", { id: "tts-provider" },
-    [["edge-tts", "Edge TTS — free, natural neural voices (recommended)"],
-     ["gtts", "Google TTS (gTTS) — free, simpler voice"]].map(([v, l]) =>
-      h("option", { value: v, text: l, ...(v === s.tts_provider ? { selected: true } : {}) })));
+  /* ---------------- VOICE ---------------- */
+  const ttsProv = h("select", { id: "tts-provider" },
+    [["edge-tts", "Edge TTS — free neural voices (recommended)"],
+     ["gtts", "gTTS — free, robotic, last resort"],
+     ["elevenlabs", "ElevenLabs — cloud, your key (free tier ≈10k chars/mo)"],
+     ["voicestudio", "VoiceStudio — self-hosted OmniVoice (local only)"]].map(([v, l]) =>
+      h("option", { value: v, text: l, ...(v === (s.tts_provider || "edge-tts") ? { selected: true } : {}) })));
   const edgeVoice = h("select", { id: "edge-voice" }, voices.map(v =>
     h("option", { value: v.id, text: v.label, ...(v.id === s.edge_voice ? { selected: true } : {}) })));
-  const edgeRate = h("input", { type: "text", value: s.edge_rate || "+0%", placeholder: "+0% (e.g. +10%, -5%)" });
-  const edgePitch = h("input", { type: "text", value: s.edge_pitch || "+0Hz", placeholder: "+0Hz (e.g. +5Hz, -10Hz)" });
+  const edgeRate = h("input", { type: "text", id: "edge-rate", value: s.edge_rate || "+0%" });
+  const edgePitch = h("input", { type: "text", id: "edge-pitch", value: s.edge_pitch || "+0Hz" });
   const gttsLang = h("select", { id: "gtts-lang" }, [
-    ["en", "English"], ["en-us", "English (US)"], ["en-gb", "English (UK)"], ["es", "Spanish"],
-    ["fr", "French"], ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["hi", "Hindi"],
+    ["en", "English"], ["en-gb", "English (UK)"], ["es", "Spanish"], ["fr", "French"],
+    ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["hi", "Hindi"],
     ["ar", "Arabic"], ["ru", "Russian"], ["ja", "Japanese"], ["ko", "Korean"], ["zh-CN", "Chinese (Simplified)"],
   ].map(([v, l]) => h("option", { value: v, text: l, ...(v === s.gtts_lang ? { selected: true } : {}) })));
+  const elKey = secInput("elevenlabs_api_key", s.elevenlabs_api_key, "ElevenLabs key (elevenlabs.io)");
+  const elVoice = h("input", { type: "text", id: "el-voice", value: s.elevenlabs_voice || "", placeholder: "voice name or id (e.g. Rachel)" });
+  const elModel = modelInput("model-el", s.elevenlabs_model, ["eleven_multilingual_v2", "eleven_flash_v2_5", "eleven_turbo_v2_5"]);
+  const elBrowse = browseBtn("🔍 My ElevenLabs voices", async (out) => {
+    const d = await api("/api/elevenlabs/voices");
+    out.textContent = d.map(v => `  ${v.name}  →  ${v.id}`).join("\n") || "(none)";
+  });
 
   const voiceCard = h("section", { class: "card" }, [
-    h("h2", { text: "Voice (text-to-speech)" }),
+    h("h2", { text: "🔊 Narration (TTS)" }),
+    h("label", { class: "field" }, [h("span", { text: "Provider" }), ttsProv]),
     h("div", { class: "grid2" }, [
-      h("label", { class: "field" }, [h("span", { text: "Provider" }), providerSel]),
-      h("label", { class: "field" }, [h("span", { text: "Edge TTS voice" }), edgeVoice]),
-      h("label", { class: "field" }, [h("span", { text: "Edge rate" }), edgeRate]),
-      h("label", { class: "field" }, [h("span", { text: "Edge pitch" }), edgePitch]),
+      h("label", { class: "field" }, [h("span", { text: "Edge voice" }), edgeVoice]),
+      h("label", { class: "field" }, [h("span", { text: "Edge rate / pitch" }), h("div", { class: "row" }, [edgeRate, edgePitch])]),
       h("label", { class: "field" }, [h("span", { text: "gTTS language" }), gttsLang]),
+      h("label", { class: "field" }, [h("span", { text: "ElevenLabs key" }), elKey]),
+      h("label", { class: "field" }, [h("span", { text: "ElevenLabs voice + 🔍" }), elVoice, elBrowse.btn]),
+      h("label", { class: "field" }, [h("span", { text: "ElevenLabs model (free: flash/turbo)" }), elModel.input, elModel.list]),
     ]),
-    h("div", { class: "row" }, [
-      h("button", { class: "btn btn-sm", text: "↻ Refresh live voice list",
-        onclick: async () => { state.voices = null; toast("Refreshing voice list…", "info", 1500); await viewSettings(); } }),
-      h("button", { class: "btn btn-sm", text: "▶ Preview selected voice",
-        onclick: async () => {
-          await saveSettings();
-          toast("Synthesizing preview…", "info", 1800);
-          try {
-            const r = await fetch("/api/settings/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ service: "tts" })});
-            const d = await r.json();
-            if (!r.ok) throw new Error(d.error || "failed");
-            toast(d.message, "good");
-          } catch (e) { toast(e.message, "bad"); }
-        } }),
-    ]),
+    elBrowse.out,
   ]);
 
-  /* mode */
-  const mockChk = h("input", { type: "checkbox", id: "mock-mode", checked: s.mock_mode });
+  /* ---------------- VOICESTUDIO ---------------- */
+  const vsUrl = h("input", { type: "text", id: "vs-url", value: s.voicestudio_url || "", placeholder: "http://127.0.0.1:3900 (localhost/LAN only — never public)" });
+  const vsKey = secInput("omnivoice_api_key", s.omnivoice_api_key, "VoiceStudio server key (stays on this PC)");
+  const vsPin = secInput("vs_share_pin", s.vs_share_pin, "6-digit share PIN (only if LAN sharing is on)");
+  const vsEngine = h("input", { type: "text", id: "vs-engine", value: s.vs_engine_id || "omnivoice" });
+  const vsVoice = h("input", { type: "text", id: "vs-voice", value: s.vs_voice_profile_id || "", placeholder: "voice profile id — blank = 'default'" });
+  const vsAck = h("input", { type: "checkbox", id: "vs-ack", checked: !!s.vs_license_ack });
+  const vsFbOn = h("input", { type: "checkbox", id: "vs-fb", checked: s.vs_fallback_enabled !== false });
+  const vsFbProv = h("select", { id: "vs-fbprov" },
+    [["edge-tts", "Edge TTS"], ["gtts", "gTTS"], ["elevenlabs", "ElevenLabs"]].map(([v, l]) =>
+      h("option", { value: v, text: l, ...(v === (s.vs_fallback_provider || "edge-tts") ? { selected: true } : {}) })));
+  const vsDiscover = browseBtn("🔍 Discover VoiceStudio", async (out) => {
+    await saveSettings();
+    const d = await api("/api/voicestudio/discover");
+    out.textContent = d.reachable
+      ? `✓ ${d.service || "VoiceStudio"} ${d.version || ""} at ${d.url}\nEngines: ${(d.engines || []).map(e => e.id || e).join(", ") || "?"}\nVoices: ${(d.voices || []).map(v => v.id || v.name || v).join(", ") || "default"}\nFeatures: ${(d.features || []).join(", ") || "—"}`
+      : `✗ Nothing answered at ${d.url} — start VoiceStudio first, then Discover again.`;
+  });
+  const cloneBtn = h("button", { class: "btn btn-sm", text: "🎙️ Clone MY voice (upload sample)…",
+    onclick: () => cloneVoiceDialog() });
+
+  const vsCard = h("section", { class: "card" }, [
+    h("h2", { text: "🎭 VoiceStudio (local OmniVoice) — optional" }),
+    h("p", { class: "small muted", text: "Runs only on your machine/LAN. The key & PIN never leave this PC (requests go server → localhost). Default OmniVoice weights are CC-BY-NC — non-commercial; tick the acknowledgement before publishing monetized videos with it. Narration style 🎭 above is also sent as acting instructions." }),
+    h("div", { class: "grid2" }, [
+      h("label", { class: "field" }, [h("span", { text: "VoiceStudio URL" }), vsUrl]),
+      h("label", { class: "field" }, [h("span", { text: "Server key (optional)" }), vsKey]),
+      h("label", { class: "field" }, [h("span", { text: "Share PIN (optional)" }), vsPin]),
+      h("label", { class: "field" }, [h("span", { text: "Engine id" }), vsEngine]),
+      h("label", { class: "field" }, [h("span", { text: "Voice profile id (blank = default)" }), vsVoice]),
+      h("label", { class: "field" }, [h("span", { text: "Fallback if VoiceStudio errors" }), h("div", { class: "row" }, [vsFbOn, vsFbProv])]),
+    ]),
+    h("label", { class: "row", style: "cursor:pointer" }, [vsAck,
+      h("span", { text: " I understand the default OmniVoice weights are CC-BY-NC (non-commercial use)." })]),
+    h("div", { class: "row" }, [vsDiscover.btn, cloneBtn]),
+    vsDiscover.out,
+  ]);
+
+  /* ---------------- MODE + TESTS ---------------- */
+  const mockChk = h("input", { type: "checkbox", id: "mock-mode", checked: !!s.mock_mode });
   const modeCard = h("section", { class: "card" }, [
     h("h2", { text: "Run mode" }),
-    h("label", { class: "row", style: "cursor:pointer" }, [
-      mockChk,
-      h("span", { html: "<b>Mock mode (offline demo)</b> — generates placeholder scripts, painted preview cards and robot voice. The entire pipeline, timeline and CapCut export work end-to-end without any API key. Turn OFF for real production." }),
-    ]),
+    h("label", { class: "row", style: "cursor:pointer" }, [mockChk,
+      h("span", { html: "<b>Mock mode (offline demo)</b> — placeholder script, painted preview cards, robot voice. The whole pipeline + CapCut export work without any key. Turn OFF for production." })]),
   ]);
 
-  /* tests + save */
   const testOut = h("div", { class: "small muted", id: "test-out" });
   async function runTest(service, label) {
     await saveSettings();
@@ -1004,9 +1113,10 @@ async function viewSettings() {
   const testCard = h("section", { class: "card" }, [
     h("h2", { text: "Test connections" }),
     h("div", { class: "row" }, [
-      h("button", { class: "btn", text: "Test script model", onclick: () => runTest("gemini_text", "Script model") }),
-      h("button", { class: "btn", text: "Test image model", onclick: () => runTest("gemini_image", "Image model") }),
-      h("button", { class: "btn", text: "Test voice (TTS)", onclick: () => runTest("tts", "TTS") }),
+      h("button", { class: "btn", text: "Test text model", onclick: () => runTest("gemini_text", "Text model") }),
+      h("button", { class: "btn", text: "Test image (one request — may take up to ~90s on Spaces)", onclick: () => runTest("gemini_image", "Image model") }),
+      h("button", { class: "btn", text: "Test narration (TTS)", onclick: () => runTest("tts", "TTS") }),
+      h("button", { class: "btn", text: "Test VoiceStudio", onclick: () => runTest("voicestudio", "VoiceStudio") }),
     ]),
     h("div", { style: "margin-top:.6rem" }, testOut),
   ]);
@@ -1016,22 +1126,92 @@ async function viewSettings() {
 
   async function saveSettings() {
     state.settings = await api("/api/settings", { method: "PUT", body: {
-      gemini_api_key: keyInput.value.trim(),
+      gemini_api_key: gemKey.value.trim(),
+      openrouter_api_key: orKey.value.trim(),
+      text_provider: textProv.value,
       text_model: textModel.input.value.trim() || "gemini-2.5-flash",
-      image_backend: backendSel.value,
+      openrouter_text_model: orTextModel.input.value.trim() || "openrouter/free",
+      narration_style: styleSel.value,
+      image_backend: imgBackend.value,
+      pollinations_api_key: pollKey.value.trim(),
+      free_image_model: pollModel.input.value.trim() || "flux",
+      hf_api_key: hfKey.value.trim(),
+      hf_image_model: hfModel.input.value.trim() || "stabilityai/stable-diffusion-xl-base-1.0",
+      hf_space_id: hfSpace.value.trim() || "Qwen/Qwen-Image-2.1",
+      openrouter_image_model: orImgModel.input.value.trim(),
       image_model: imgModel.input.value.trim() || "gemini-2.5-flash-image",
       imagen_model: imagenModel.input.value.trim() || "imagen-3.0-generate-002",
-      tts_provider: providerSel.value,
+      leonardo_api_key: leoKey.value.trim(),
+      leonardo_model_id: leoModel.value.trim(),
+      tts_provider: ttsProv.value,
       edge_voice: edgeVoice.value,
       edge_rate: edgeRate.value.trim() || "+0%",
       edge_pitch: edgePitch.value.trim() || "+0Hz",
       gtts_lang: gttsLang.value,
+      elevenlabs_api_key: elKey.value.trim(),
+      elevenlabs_voice: elVoice.value.trim(),
+      elevenlabs_model: elModel.input.value.trim() || "eleven_multilingual_v2",
+      voicestudio_url: vsUrl.value.trim(),
+      omnivoice_api_key: vsKey.value.trim(),
+      vs_share_pin: vsPin.value.trim(),
+      vs_engine_id: vsEngine.value.trim() || "omnivoice",
+      vs_voice_profile_id: vsVoice.value.trim(),
+      vs_license_ack: vsAck.checked,
+      vs_fallback_enabled: vsFbOn.checked,
+      vs_fallback_provider: vsFbProv.value,
       mock_mode: mockChk.checked,
     }});
     $("#mock-badge").classList.toggle("hidden", !state.settings.mock_mode);
   }
 
-  view.append(geminiCard, voiceCard, modeCard, testCard, saveBtn);
+  view.append(textCard, imgCard, voiceCard, vsCard, modeCard, testCard, saveBtn);
+}
+
+function secInput(name, maskedOrEmpty, placeholder) {
+  // Server masks secrets as •••••• — echoing that straight back tells the
+  // server "keep the stored value"; typing anything replaces it.
+  return h("input", { type: "password", value: maskedOrEmpty || "", placeholder,
+    autocomplete: "new-password", dataset: { secret: name } });
+}
+
+function browseBtn(label, handler) {
+  const out = h("pre", { class: "small muted", style: "white-space:pre-wrap;max-height:12rem;overflow:auto;margin:.4rem 0 0" });
+  const btn = h("button", { class: "btn btn-sm", text: label, onclick: async () => {
+    out.textContent = "Loading…";
+    try { await handler(out); } catch (e) { out.textContent = "✗ " + e.message; }
+  } });
+  return { btn, out };
+}
+
+function cloneVoiceDialog() {
+  const name = h("input", { type: "text", placeholder: "Name for your voice (e.g. 'My Narration Voice')" });
+  const refText = h("textarea", { rows: 3, placeholder: "Exact transcript of the sample (what you said)" });
+  const file = h("input", { type: "file", accept: "audio/*" });
+  modal("🎙️ Clone your voice", [
+    h("p", { class: "small muted", text: "Upload a short clean sample of YOUR OWN voice (~10–30 s). It goes only to the VoiceStudio running on YOUR machine — never to any cloud. Only clone voices you have rights to." }),
+    h("label", { class: "field" }, [h("span", { text: "Sample audio" }), file]),
+    h("label", { class: "field" }, [h("span", { text: "Voice name" }), name]),
+    h("label", { class: "field" }, [h("span", { text: "Transcript (recommended)" }), refText]),
+  ], [
+    h("button", { class: "btn btn-primary", text: "Clone", onclick: async (ev) => {
+      if (!file.files[0]) { toast("Pick an audio file first", "bad"); return; }
+      const fd = new FormData();
+      fd.append("name", name.value.trim() || "My Voice");
+      fd.append("ref_text", refText.value.trim());
+      fd.append("ref_audio", file.files[0]);
+      ev.target.disabled = true; ev.target.textContent = "Cloning…";
+      try {
+        const r = await fetch("/api/voicestudio/clone", { method: "POST", body: fd });
+        const d = await r.json();
+        if (!r.ok || d.ok === false) throw new Error(d.error || "clone failed");
+        document.getElementById("vs-voice").value = d.voice_id;
+        toast(`Cloned! Voice id ${d.voice_id} — filled in for you. Save settings.`, "good", 7000);
+        modalClose();
+      } catch (e) { toast(e.message, "bad", 8000); }
+      ev.target.disabled = false; ev.target.textContent = "Clone";
+    } }),
+    h("button", { class: "btn", text: "Cancel", onclick: () => modalClose() }),
+  ]);
 }
 
 function modelInput(id, value, suggestions) {
