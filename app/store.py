@@ -80,6 +80,7 @@ def save_project(proj: dict) -> None:
 
 def list_projects() -> list[dict]:
     out = []
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)  # survives data/ wipes mid-run
     for d in PROJECTS_DIR.iterdir():
         if not d.is_dir():
             continue
