@@ -196,11 +196,17 @@ def _synth_elevenlabs(text: str, settings: dict, log=None) -> tuple[bytes, str]:
 
 
 # ------------------------------------------------------------ VoiceStudio
+# Contract source: VoiceStudio OpenAPI v0.5.6.
+#   speech    POST /v1/audio/speech       {model, input<=4096, voice, instructions, response_format, speed}
+#             (404 fallback: POST /generate multipart for older builds)
+#   clone     POST /profiles              multipart {name, ref_audio, ref_text, kind=clone}
+#   engines   GET /engines    voices GET /v1/audio/voices (+ /profiles)
+#   cap doc   GET /.well-known/voicestudio-speech
 def vs_headers(settings: dict) -> dict:
     """Server-side-only headers for VoiceStudio. Never raise values into UI."""
     key = (settings.get("omnivoice_api_key") or "").strip()
     pin = (settings.get("vs_share_pin") or "").strip()
-    h = {}
+    h, params = {}, None
     if key:
         h["Authorization"] = "Bearer " + key
     if pin:
@@ -222,120 +228,160 @@ def _vs_url(settings: dict) -> str:
     return u
 
 
-def voicestudio_discover(settings: dict) -> dict:
-    """Hit VoiceStudio's discovery surface: service info, engines, voices,
-    capabilities, pronunciation count. Safe to call without touching Speech."""
+def _vs_get(settings: dict, path: str, params: dict | None = None, timeout: int = 10):
     import requests
     base = _vs_url(settings)
-    h = vs_headers(settings)
-    out = {"url": base, "reachable": False, "service": None, "version": None,
-           "engines": [], "voices": [], "features": [], "pronunciation": [],
-           "default_voice": "default", "docs": {}}
-    # canonical discovery document
-    for path in ("/.well-known/voicestudio-speech", "/.well-known/voice-studio", "/api/info", "/docs"):
-        try:
-            r = requests.get(base + path, headers=h, timeout=8)
-            if r.ok and "application/json" in (r.headers.get("content-type") or "") or r.ok:
-                try:
-                    j = r.json()
-                except Exception:
-                    j = None
-                if isinstance(j, dict):
-                    out["docs"][path] = j
-                    out["service"] = (j.get("service") or j.get("name") or out["service"])
-                    out["version"] = (j.get("version") or out["version"])
-                    feats = j.get("features") or j.get("capabilities")
-                    if isinstance(feats, dict):
-                        out["features"] = sorted([k for k, v in feats.items() if v])
-            if r.ok:
-                out["reachable"] = True
-        except Exception:  # noqa: BLE001
-            continue
+    try:
+        r = requests.get(base + path, headers=vs_headers(settings), params=params, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"Cannot reach VoiceStudio at {base} — is it running? Start VoiceStudio, then retry. ({e})") from e
+    if r.status_code == 401:
+        raise RuntimeError(
+            "VoiceStudio rejected authentication (HTTP 401). If VoiceStudio's Network share "
+            "feature is on, set the 6-digit share PIN in Settings → VoiceStudio.")
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return r.content
+
+
+def voicestudio_discover(settings: dict) -> dict:
+    """Probe VoiceStudio v0.5.6 surfaces: capabilities doc, engines, voices,
+    profiles, pronunciation count, health. Never raises for missing optional
+    surfaces — only the base URL being unreachable is a hard failure."""
+    base = _vs_url(settings)
+    out = {"url": base, "reachable": False, "service": "VoiceStudio",
+           "version": None, "engines": [], "voices": [], "profiles": [],
+           "features": {}, "pronunciation_count": None, "healthy": None}
+    # health first (cheap)
+    try:
+        j = _vs_get(settings, "/health", timeout=5)
+        out["reachable"] = True
+        out["healthy"] = True
+        if isinstance(j, dict):
+            out["version"] = j.get("version") or out["version"]
+            out["service"] = j.get("service") or j.get("app") or out["service"]
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"No VoiceStudio answered at {base} — is the app running? Start VoiceStudio, "
+            f"then press Discover again. ({e})") from e
+    # capabilities doc (optional)
+    try:
+        j = _vs_get(settings, "/.well-known/voicestudio-speech", timeout=5)
+        if isinstance(j, dict):
+            out["version"] = j.get("version") or out["version"]
+            out["service"] = j.get("service") or j.get("name") or out["service"]
+            feats = j.get("features") or j.get("capabilities") or {}
+            if isinstance(feats, dict):
+                out["features"] = feats
+    except Exception:
+        pass
     # engines
-    for path in ("/engines", "/v1/engines", "/api/engines"):
-        try:
-            r = requests.get(base + path, headers=h, timeout=8)
-            if r.ok:
-                j = r.json()
-                eng = j.get("engines") if isinstance(j, dict) else j
-                if isinstance(eng, list):
-                    out["engines"] = eng
-                    out["reachable"] = True
-                    break
-        except Exception:  # noqa: BLE001
-            continue
-    # voices / profiles
-    for path in ("/voices", "/v1/voices", "/api/voices", "/profiles"):
-        try:
-            r = requests.get(base + path, headers=h, timeout=8)
-            if r.ok:
-                j = r.json()
-                vs = j.get("voices") if isinstance(j, dict) else j
-                if isinstance(vs, list):
-                    out["voices"] = vs
-                    out["reachable"] = True
-                    break
-        except Exception:  # noqa: BLE001
-            continue
-    # pronunciation dictionary
-    for path in ("/pronunciation", "/v1/pronunciation"):
-        try:
-            r = requests.get(base + path, headers=h, timeout=8)
-            if r.ok:
-                j = r.json()
-                pr = j.get("entries") if isinstance(j, dict) else j
-                if isinstance(pr, (list, dict)):
-                    out["pronunciation"] = pr
-                    out["reachable"] = True
-                    break
-        except Exception:  # noqa: BLE001
-            continue
+    try:
+        j = _vs_get(settings, "/engines", timeout=8)
+        eng = j.get("engines") if isinstance(j, dict) else j
+        if isinstance(eng, list):
+            out["engines"] = eng
+    except Exception:
+        pass
+    # voices (OpenAI-style list)
+    try:
+        j = _vs_get(settings, "/v1/audio/voices", timeout=8)
+        vs = j.get("voices") if isinstance(j, dict) else j
+        if isinstance(vs, list):
+            out["voices"] = vs
+    except Exception:
+        pass
+    # profiles (cloned/designed voices)
+    try:
+        j = _vs_get(settings, "/profiles", timeout=8)
+        pr = j.get("profiles") if isinstance(j, dict) else j
+        if isinstance(pr, list):
+            out["profiles"] = pr
+    except Exception:
+        pass
+    # pronunciation count
+    try:
+        j = _vs_get(settings, "/pronunciation", timeout=8)
+        entries = j.get("entries") if isinstance(j, dict) else j
+        if isinstance(entries, list):
+            out["pronunciation_count"] = len(entries)
+    except Exception:
+        pass
     return out
 
 
 def _voicestudio_synthesize(text: str, settings: dict,
                             instructions: str | None = None) -> tuple[bytes, str]:
-    """VoiceStudio SpeechRequest. Respects ≤4,096 chars/request; callers
-    chunk longer text at sentence boundaries."""
+    """OpenAI-compatible POST /v1/audio/speech (v0.5.6). ≤4,096 chars per
+    request — the chunked wrapper handles splitting. Retries respect the
+    server's Retry-After header on 429."""
     import requests
     base = _vs_url(settings)
     engine = (settings.get("vs_engine_id") or "omnivoice").strip() or "omnivoice"
     voice = (settings.get("vs_voice_profile_id") or "").strip() or "default"
     if len(text) > 4096:
         raise RuntimeError("VoiceStudio SpeechRequest text must be ≤ 4,096 characters.")
-    payload = {
-        "engine_id": engine,
-        "voice": voice,
-        "profile_id": voice if voice != "default" else None,
-        "text": text,
-        "format": "mp3",
-        "speed": 1.0,
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
+    payload = {"model": engine, "input": text, "voice": voice,
+               "response_format": "mp3", "speed": 1.0, "stream_format": "audio"}
     if instructions:
-        payload["instructions"] = instructions
+        payload["instructions"] = instructions[:4096]
     try:
-        r = requests.post(base + "/v1/speech", json=payload,
+        r = requests.post(base + "/v1/audio/speech", json=payload,
                           headers={**vs_headers(settings), "Content-Type": "application/json"},
-                          timeout=180, stream=False)
+                          timeout=300)
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             f"Cannot reach VoiceStudio at {base} — is the app running? Start VoiceStudio, then retry. ({e})") from e
+    if r.status_code == 404:
+        # older build without the OpenAI-compatible route — use the classic one
+        return _voicestudio_synthesize_legacy(text, settings, base, instructions)
     if r.status_code == 429:
         ra = r.headers.get("Retry-After")
         raise RuntimeError(
-            f"VoiceStudio is rate-limiting (HTTP 429); respect Retry-After={ra or '?'} — wait and retry.")
+            f"VoiceStudio is rate-limiting (HTTP 429) — respect Retry-After={ra or '?'}s: "
+            "wait that long before retrying.")
     if r.status_code == 401:
         raise RuntimeError(
-            "VoiceStudio rejected authentication (HTTP 401). If the VoiceStudio PIN share "
-            "feature is on, set the 6-digit PIN in Settings → VoiceStudio share PIN; "
-            "otherwise leave it blank.")
+            "VoiceStudio rejected authentication (HTTP 401). If VoiceStudio's Network share "
+            "feature is on, set the 6-digit share PIN in Settings → VoiceStudio share PIN; "
+            "with loopback only, leave it blank.")
     if r.status_code == 400 and "license" in r.text.lower():
         raise RuntimeError(
             "VoiceStudio refused with a license/compliance error (HTTP 400). Default OmniVoice "
-            "weights are CC-BY-NC (non-commercial) — switch engine/weights or acknowledge "
-            "the non-commercial terms in Settings before production use.")
-    r.raise_for_status()
+            "weights are CC-BY-NC (non-commercial) — accept the license inside VoiceStudio "
+            "and/or switch to approved engine weights before production use.")
+    if r.status_code >= 400:
+        raise RuntimeError(f"VoiceStudio speech failed (HTTP {r.status_code}): {r.text[:300]}")
+    ctype = (r.headers.get("content-type") or "audio/mpeg").split(";")[0]
+    if "json" in ctype:
+        raise RuntimeError(f"VoiceStudio answered with JSON instead of audio: {r.text[:200]}")
+    if not r.content or len(r.content) < 100:
+        raise RuntimeError("VoiceStudio returned effectively empty audio.")
+    return r.content, ctype
+
+
+def _voicestudio_synthesize_legacy(text: str, settings: dict, base: str,
+                                   instructions: str | None) -> tuple[bytes, str]:
+    """Fallback for older builds: POST /generate (multipart form)."""
+    import requests
+    voice = (settings.get("vs_voice_profile_id") or "").strip()
+    data = {"text": text, "effect_preset": "broadcast"}
+    if voice and voice != "default":
+        data["profile_id"] = voice
+    if instructions:
+        data["instruct"] = instructions[:4096]
+    engine = (settings.get("vs_engine_id") or "").strip()
+    if engine:
+        data["engine"] = engine
+    r = requests.post(base + "/generate", data=data, headers=vs_headers(settings), timeout=300)
+    if r.status_code == 429:
+        ra = r.headers.get("Retry-After")
+        raise RuntimeError(f"VoiceStudio rate-limit (429), Retry-After={ra or '?'}s.")
+    if r.status_code >= 400:
+        raise RuntimeError(f"VoiceStudio /generate failed (HTTP {r.status_code}): {r.text[:300]}")
     ctype = (r.headers.get("content-type") or "audio/mpeg").split(";")[0]
     return r.content, ctype
 
@@ -345,10 +391,8 @@ def _voicestudio_synthesize_chunked(text: str, settings: dict, log=None) -> tupl
     chunks = _chunk_for_limit(text, 3800)
     if log and len(chunks) > 1:
         log(f"VoiceStudio: sending {len(chunks)} chunks ({len(text)} chars)…")
-    instructions = None
     style = (settings.get("narration_style") or "").strip().lower()
-    if style in NARRATION_INSTRUCTIONS:
-        instructions = NARRATION_INSTRUCTIONS[style]
+    instructions = NARRATION_INSTRUCTIONS.get(style)
     parts: list[bytes] = []
     ctype = "audio/mpeg"
     for i, ch in enumerate(chunks):
@@ -386,32 +430,238 @@ def _chunk_for_limit(text: str, limit: int) -> list[str]:
 
 
 def voicestudio_clone_voice(name: str, ref_audio_path: Path, ref_text: str,
-                            settings: dict, log=None) -> dict:
-    """Register a cloned voice the user *deliberately provided*; multipart
-    upload stays purely server → loopback/private VoiceStudio."""
+                            settings: dict, personality: str = "", log=None) -> dict:
+    """POST /profiles — register a cloned voice the user *deliberately
+    provided*; multipart stays purely server → loopback/private VoiceStudio."""
     import requests
     base = _vs_url(settings)
     if not ref_audio_path.exists():
         raise RuntimeError(f"Reference audio not found: {ref_audio_path}")
     with open(ref_audio_path, "rb") as fh:
         files = {"ref_audio": (ref_audio_path.name, fh, "application/octet-stream")}
-        data = {"name": name, "ref_text": ref_text, "kind": "clone"}
+        data = {"name": name, "ref_text": ref_text or "", "kind": "clone",
+                "language": "Auto"}
+        if personality:
+            data["personality"] = personality
         try:
-            r = requests.post(base + "/v1/voices", files=files, data=data,
-                              headers=vs_headers(settings), timeout=240)
+            r = requests.post(base + "/profiles", files=files, data=data,
+                              headers=vs_headers(settings), timeout=300)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"Cannot reach VoiceStudio at {base} ({e})") from e
-    if r.status_code in (400, 401, 403, 404, 409, 422):
+    if r.status_code >= 400:
         raise RuntimeError(f"VoiceStudio rejected the clone request (HTTP {r.status_code}): {r.text[:400]}")
-    r.raise_for_status()
     try:
         j = r.json()
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("VoiceStudio responded without JSON to the clone call.") from e
-    vid = j.get("id") or j.get("profile_id") or j.get("voice_id")
+    vid = (j.get("id") or j.get("profile_id")
+           or (j.get("profile") or {}).get("id") or j.get("voice_id"))
     if not vid:
-        raise RuntimeError("VoiceStudio clone did not return a voice id/profile_id.")
+        raise RuntimeError(f"VoiceStudio clone did not return a profile id: {str(j)[:200]}")
     return {"id": vid, "raw": j}
+
+
+# ------------------------------------------------- pronunciation dictionary
+def voicestudio_pronunciation_list(settings: dict) -> list[dict]:
+    j = _vs_get(settings, "/pronunciation", timeout=10)
+    entries = j.get("entries") if isinstance(j, dict) else j
+    if not isinstance(entries, list):
+        raise RuntimeError(f"Unexpected pronunciation list shape: {str(j)[:200]}")
+    return entries
+
+
+def voicestudio_pronunciation_add(settings: dict, term: str, replacement: str,
+                                  ptype: str = "respelling", language: str = "*",
+                                  enabled: bool = True) -> dict:
+    import requests
+    base = _vs_url(settings)
+    if not term.strip():
+        raise RuntimeError("Pronunciation entry needs a term.")
+    try:
+        r = requests.post(base + "/pronunciation", headers=vs_headers(settings),
+                          json={"term": term.strip(), "replacement": replacement,
+                                "type": ptype or "respelling", "language": language or "*",
+                                "enabled": bool(enabled)}, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    if r.status_code == 400:
+        raise RuntimeError(f"VoiceStudio rejected the entry (400): {r.text[:300]} — one bad "
+                           "row fails the whole import in VS, so check spelling/field values.")
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {"term": term}
+
+
+def voicestudio_pronunciation_update(settings: dict, entry_id, **fields) -> dict:
+    import requests
+    base = _vs_url(settings)
+    allowed = {k: v for k, v in fields.items()
+               if k in ("term", "replacement", "type", "language", "enabled") and v is not None}
+    if not allowed:
+        raise RuntimeError("Nothing to update.")
+    try:
+        r = requests.put(f"{base}/pronunciation/{entry_id}", headers=vs_headers(settings),
+                         json=allowed, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    if r.status_code == 404:
+        raise RuntimeError(f"No pronunciation entry with id {entry_id}.")
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {"id": entry_id}
+
+
+def voicestudio_pronunciation_delete(settings: dict, entry_id) -> None:
+    import requests
+    base = _vs_url(settings)
+    try:
+        r = requests.delete(f"{base}/pronunciation/{entry_id}", headers=vs_headers(settings), timeout=15)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    if r.status_code == 404:
+        raise RuntimeError(f"No pronunciation entry with id {entry_id}.")
+    r.raise_for_status()
+
+
+def voicestudio_pronunciation_test(settings: dict, text: str, language: str | None = None) -> dict:
+    """Preview how the dictionary rewrites a piece of narration."""
+    import requests
+    base = _vs_url(settings)
+    body = {"text": text}
+    if language:
+        body["language"] = language
+    try:
+        r = requests.post(base + "/pronunciation/test", headers=vs_headers(settings),
+                          json=body, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("VoiceStudio answer to /pronunciation/test was not JSON.") from e
+
+
+def voicestudio_pronunciation_export(settings: dict) -> str:
+    j = _vs_get(settings, "/pronunciation/export", timeout=15)
+    if isinstance(j, (dict, list)):
+        import json as _j
+        return _j.dumps(j, indent=1)
+    return j.decode("utf-8", "replace") if isinstance(j, bytes) else str(j)
+
+
+# ------------------------------------------------------------- archetypes
+def voicestudio_archetypes(settings: dict, q: str = "", limit: int = 24,
+                           offset: int = 0, **filters) -> dict:
+    params = {"q": q, "limit": limit, "offset": offset}
+    for k in ("use_case", "gender", "age", "pitch", "accent", "lang"):
+        if filters.get(k):
+            params[k] = filters[k]
+    j = _vs_get(settings, "/archetypes", params={k: v for k, v in params.items() if v != ""}, timeout=10)
+    if isinstance(j, dict):
+        items = j.get("items") or j.get("archetypes") or j.get("results") or []
+        return {"items": items if isinstance(items, list) else [],
+                "total": j.get("total"), "count": len(items) if isinstance(items, list) else 0}
+    if isinstance(j, list):
+        return {"items": j, "total": None, "count": len(j)}
+    return {"items": [], "total": None, "count": 0}
+
+
+def voicestudio_archetype_use(settings: dict, archetype_id: str) -> dict:
+    """Materialize an archetype into a voice profile (renders a reference
+    sample inside VoiceStudio and inserts the profile)."""
+    import requests
+    base = _vs_url(settings)
+    try:
+        r = requests.post(f"{base}/archetypes/{archetype_id}/use",
+                          headers=vs_headers(settings), timeout=120)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    if r.status_code == 404:
+        raise RuntimeError(f"Archetype '{archetype_id}' not found — refresh the browser list.")
+    r.raise_for_status()
+    j = r.json()
+    pid = (j.get("profile_id") or j.get("id") or (j.get("profile") or {}).get("id"))
+    return {"profile_id": pid, "raw": j}
+
+
+def voicestudio_personalities(settings: dict) -> list:
+    j = _vs_get(settings, "/personalities", timeout=10)
+    items = j.get("personalities") if isinstance(j, dict) else j
+    return items if isinstance(items, list) else []
+
+
+# ------------------------------------------------------------ longform
+def voicestudio_audiobook(settings: dict, text: str, voice: str | None = None,
+                          fmt: str = "mp3", title: str = "", metadata: dict | None = None,
+                          lexicon: dict | None = None) -> dict:
+    """Hand the WHOLE script to VoiceStudio's chapterized longform renderer
+    (streams SSE progress server-side; we wait for completion and return its
+    final payload). Long texts intentionally bypass the 4,096-char speech cap."""
+    import requests
+    base = _vs_url(settings)
+    v = (voice or (settings.get("vs_voice_profile_id") or "").strip() or "default")
+    md = dict(metadata or {})
+    if title and "title" not in md:
+        md["title"] = title
+    body = {"text": text, "default_voice": v, "format": fmt, "bitrate": "128k",
+            "metadata": md or None, "lexicon": lexicon}
+    body = {k: v2 for k, v2 in body.items() if v2 is not None}
+    try:
+        r = requests.post(base + "/audiobook", headers=vs_headers(settings), json=body,
+                          timeout=7200, stream=False)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+    if r.status_code == 429:
+        ra = r.headers.get("Retry-After")
+        raise RuntimeError(f"VoiceStudio audiobook queue is busy (429), Retry-After={ra or '?'}s.")
+    if r.status_code >= 400:
+        raise RuntimeError(f"Audiobook render refused (HTTP {r.status_code}): {r.text[:300]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"note": "render accepted (non-JSON reply)", "bytes": len(r.content)}
+
+
+def voicestudio_audiobook_jobs(settings: dict) -> list:
+    """Interrupted longform renders that VoiceStudio can resume."""
+    j = _vs_get(settings, "/audiobook/jobs", timeout=10)
+    jobs = j.get("jobs") if isinstance(j, dict) else j
+    return jobs if isinstance(jobs, list) else []
+
+
+# ---------------------------------------------------------------- batch dub
+def voicestudio_batch_enqueue(settings: dict, video_path: Path, langs: str = "es",
+                              voice_id: str | None = None, preserve_bg: bool = True) -> dict:
+    import requests
+    base = _vs_url(settings)
+    if not video_path.exists():
+        raise RuntimeError(f"Video not found: {video_path}")
+    with open(video_path, "rb") as fh:
+        files = {"video": (video_path.name, fh, "application/octet-stream")}
+        data = {"langs": langs, "preserve_bg": "true" if preserve_bg else "false"}
+        if voice_id:
+            data["voice_id"] = voice_id
+        try:
+            r = requests.post(base + "/batch/enqueue", files=files, data=data,
+                              headers=vs_headers(settings), timeout=600)
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(f"Cannot reach VoiceStudio at {base} — is it running? ({e})") from e
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Batch upload failed: {e}") from e
+    if r.status_code >= 400:
+        raise RuntimeError(f"Batch enqueue failed (HTTP {r.status_code}): {r.text[:300]}")
+    return r.json()
+
+
+def voicestudio_batch_jobs(settings: dict) -> list:
+    j = _vs_get(settings, "/batch/jobs", timeout=15)
+    jobs = j.get("jobs") if isinstance(j, dict) else j
+    return jobs if isinstance(jobs, list) else []
 
 
 # ------------------------------------------------------------ public API

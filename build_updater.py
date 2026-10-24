@@ -39,7 +39,7 @@ FILES = [
     "tests/test_voicestudio.py",
 ]
 
-STAMP = "v13 — 2026-10-24"
+STAMP = "v14 — 2026-10-24"
 
 
 def main() -> None:

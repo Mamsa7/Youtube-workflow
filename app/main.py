@@ -618,11 +618,148 @@ def vs_discover():
         return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
 
 
+# ------------------------------------------------ pronunciation dictionary
 @app.get("/api/voicestudio/pronunciation")
 def vs_pronunciation_get():
     try:
-        info = tts_service.voicestudio_discover(config.get_settings())
-        return _ok(info.get("pronunciation") or [])
+        return _ok(tts_service.voicestudio_pronunciation_list(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.post("/api/voicestudio/pronunciation")
+def vs_pronunciation_add(payload: dict = Body(...)):
+    try:
+        return _ok(tts_service.voicestudio_pronunciation_add(
+            config.get_settings(),
+            term=payload.get("term", ""), replacement=payload.get("replacement", ""),
+            ptype=payload.get("type", "respelling"), language=payload.get("language", "*"),
+            enabled=payload.get("enabled", True)))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.put("/api/voicestudio/pronunciation/{entry_id}")
+def vs_pronunciation_put(entry_id: str, payload: dict = Body(...)):
+    try:
+        return _ok(tts_service.voicestudio_pronunciation_update(
+            config.get_settings(), entry_id, **payload))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.delete("/api/voicestudio/pronunciation/{entry_id}")
+def vs_pronunciation_del(entry_id: str):
+    try:
+        tts_service.voicestudio_pronunciation_delete(config.get_settings(), entry_id)
+        return _ok(deleted=entry_id)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.post("/api/voicestudio/pronunciation/test")
+def vs_pronunciation_test(payload: dict = Body(...)):
+    try:
+        return _ok(tts_service.voicestudio_pronunciation_test(
+            config.get_settings(), payload.get("text", ""), payload.get("language")))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+# ------------------------------------------------- archetypes/personalities
+@app.get("/api/voicestudio/archetypes")
+def vs_archetypes(q: str = "", limit: int = 24, offset: int = 0,
+                  gender: str = "", use_case: str = ""):
+    try:
+        return _ok(tts_service.voicestudio_archetypes(
+            config.get_settings(), q=q, limit=min(limit, 60), offset=offset,
+            gender=gender, use_case=use_case))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.get("/api/voicestudio/personalities")
+def vs_personalities():
+    try:
+        return _ok(tts_service.voicestudio_personalities(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+@app.post("/api/voicestudio/archetypes/{aid}/use")
+def vs_archetype_use(aid: str):
+    try:
+        s = config.get_settings()
+        if not s.get("vs_license_ack"):
+            return JSONResponse({"ok": False, "error":
+                "Acknowledge the CC-BY-NC license note in Settings → VoiceStudio first."},
+                status_code=400)
+        out = tts_service.voicestudio_archetype_use(s, aid)
+        return _ok(out)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+# ------------------------------------------------------------- longform
+@app.post("/api/projects/{pid}/voicestudio/audiobook")
+def vs_audiobook_render(pid: str, payload: dict = Body(default={})):
+    """Send the approved script's narration to VoiceStudio's chapterized
+    longform renderer (bypasses the 4,096-char speech cap by design)."""
+    p = _project_or_404(pid)
+    s = config.get_settings()
+    if not s.get("vs_license_ack"):
+        return JSONResponse({"ok": False, "error":
+            "Acknowledge the CC-BY-NC license note in Settings → VoiceStudio first."},
+            status_code=400)
+    if not p.get("script"):
+        raise HTTPException(400, "Generate a script first.")
+    text = "\n\n".join(b["narration"] for b in p["script"]["beats"])
+    try:
+        out = tts_service.voicestudio_audiobook(
+            s, text, title=p.get("title", ""), fmt=payload.get("format", "mp3"),
+            metadata={"project": p.get("title", pid), "source": "StickStory Studio"})
+        return _ok(out)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:500]}, status_code=400)
+
+
+@app.get("/api/voicestudio/audiobook/jobs")
+def vs_audiobook_jobs():
+    try:
+        return _ok(tts_service.voicestudio_audiobook_jobs(config.get_settings()))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
+
+
+# ---------------------------------------------------------------- batch dub
+@app.post("/api/voicestudio/batch/enqueue")
+async def vs_batch_enqueue(langs: str = Form("es"), preserve_bg: bool = Form(True),
+                           video: UploadFile = File(...)):
+    import shutil
+    s = config.get_settings()
+    if not s.get("vs_license_ack"):
+        return JSONResponse({"ok": False, "error":
+            "Acknowledge the CC-BY-NC license note in Settings → VoiceStudio first."},
+            status_code=400)
+    tmp = config.DATA_DIR / "batch_uploads"
+    tmp.mkdir(exist_ok=True)
+    dest = tmp / f"{uuid.uuid4().hex[:8]}_{Path(video.filename or 'video.mp4').name}"
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(video.file, out)
+    try:
+        out = tts_service.voicestudio_batch_enqueue(
+            s, dest, langs=langs, voice_id=(s.get("vs_voice_profile_id") or None),
+            preserve_bg=preserve_bg)
+    except Exception as e:  # noqa: BLE001
+        dest.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(e)[:500]}, status_code=400)
+    return _ok(out)
+
+
+@app.get("/api/voicestudio/batch/jobs")
+def vs_batch_jobs():
+    try:
+        return _ok(tts_service.voicestudio_batch_jobs(config.get_settings()))
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)[:400]}, status_code=400)
 

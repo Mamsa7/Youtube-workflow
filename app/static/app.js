@@ -117,6 +117,15 @@ function anyRunning(p) {
   return Object.values(p.jobs || {}).some(j => j.state === "running");
 }
 
+function voiceLabel() {
+  const s = state.settings || {};
+  const prov = s.tts_provider || "edge-tts";
+  if (prov === "gtts") return `Google TTS · ${s.gtts_lang}`;
+  if (prov === "elevenlabs") return `ElevenLabs · ${s.elevenlabs_voice || "?"}`;
+  if (prov === "voicestudio") return `VoiceStudio (local) · ${s.vs_voice_profile_id || "default"} · ${s.vs_engine_id || "omnivoice"}`;
+  return `Edge TTS · ${s.edge_voice}`;
+}
+
 /* ---------------------------------------------------------------- state */
 const state = { settings: null, bible: null, voices: null, sfxLib: null, project: null, poll: null };
 
@@ -447,12 +456,22 @@ function sectionVoice(p) {
       h("h2", { text: "③ VOICE & TIMELINE" }), jobBadge(p, "voice"),
       st === "done" ? badge("✓ voice ready", "badge-good") : badge("not started")].filter(Boolean)),
     h("div", { class: "row" }, [
-      h("span", { class: "small muted", text: `${state.settings.tts_provider === "gtts" ? "Google TTS" : "Edge TTS"} · ${state.settings.tts_provider === "gtts" ? state.settings.gtts_lang : state.settings.edge_voice}` }),
+      h("span", { class: "small muted", text: voiceLabel() }),
       h("a", { class: "small", href: "#/settings", text: "change" }),
       h("button", { class: "btn btn-primary", disabled: !p.script,
         html: p.voice && p.voice.full ? "🔁 Regenerate voice" : "🎙 Generate voiceover",
         onclick: () => runJob(p, "voice", `/api/projects/${p.id}/voice/generate`) }),
-    ]),
+      state.settings.voicestudio_url ? h("button", { class: "btn btn-sm", text: "📕 Audiobook render",
+        title: "Send the whole narration to VoiceStudio's longform/audiobook renderer (no 4,096-char cap; chapters, loudness, metadata)",
+        onclick: async () => {
+          try {
+            const r = await fetch(`/api/projects/${p.id}/voicestudio/audiobook`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+            const d = await r.json();
+            if (!r.ok || d.ok === false) throw new Error(d.error || "failed");
+            toast("Audiobook render handed to VoiceStudio — watch progress/final file in VoiceStudio's own UI.", "good", 8000);
+          } catch (e) { toast(e.message, "bad", 8000); }
+        } }) : null,
+    ].filter(Boolean)),
   ]));
   if (!p.script) { sec.append(h("p", { class: "muted", text: "Generate the script first." })); return sec; }
   if (!p.voice || !p.voice.beats || !p.voice.beats.length) {
@@ -1063,9 +1082,14 @@ async function viewSettings() {
   const vsDiscover = browseBtn("🔍 Discover VoiceStudio", async (out) => {
     await saveSettings();
     const d = await api("/api/voicestudio/discover");
-    out.textContent = d.reachable
-      ? `✓ ${d.service || "VoiceStudio"} ${d.version || ""} at ${d.url}\nEngines: ${(d.engines || []).map(e => e.id || e).join(", ") || "?"}\nVoices: ${(d.voices || []).map(v => v.id || v.name || v).join(", ") || "default"}\nFeatures: ${(d.features || []).join(", ") || "—"}`
-      : `✗ Nothing answered at ${d.url} — start VoiceStudio first, then Discover again.`;
+    const names = (arr) => (arr || []).map(x => (x && (x.id || x.name || x.profile_id)) || x).slice(0, 12).join(", ");
+    out.textContent =
+      `✓ ${d.service || "VoiceStudio"} ${d.version || ""} answering at ${d.url}\n` +
+      `Engines: ${names(d.engines) || "?"}\n` +
+      `Voices: ${names(d.voices) || "default"}\n` +
+      `Cloned/designed profiles: ${names(d.profiles) || "—"}\n` +
+      `Pronunciation entries: ${d.pronunciation_count ?? "?"}\n` +
+      (d.features && Object.keys(d.features).length ? `Features: ${Object.keys(d.features).filter(k => d.features[k]).join(", ")}` : "");
   });
   const cloneBtn = h("button", { class: "btn btn-sm", text: "🎙️ Clone MY voice (upload sample)…",
     onclick: () => cloneVoiceDialog() });
@@ -1083,7 +1107,14 @@ async function viewSettings() {
     ]),
     h("label", { class: "row", style: "cursor:pointer" }, [vsAck,
       h("span", { text: " I understand the default OmniVoice weights are CC-BY-NC (non-commercial use)." })]),
-    h("div", { class: "row" }, [vsDiscover.btn, cloneBtn]),
+    h("div", { class: "row" }, [vsDiscover.btn, cloneBtn,
+      h("button", { class: "btn btn-sm", text: "📖 Pronunciation dictionary…",
+        onclick: () => pronunciationDialog() }),
+      h("button", { class: "btn btn-sm", text: "🎭 Browse archetypes…",
+        onclick: () => archetypesDialog() }),
+      h("button", { class: "btn btn-sm", text: "🌍 Batch video dub…",
+        onclick: () => batchDubDialog() }),
+    ]),
     vsDiscover.out,
   ]);
 
@@ -1218,4 +1249,140 @@ function modelInput(id, value, suggestions) {
   const list = h("datalist", { id }, suggestions.map(sname => h("option", { value: sname })));
   const input = h("input", { type: "text", value, list: id, placeholder: "model name" });
   return { input, list };
+}
+
+/* ================================================ VOICESTUDIO v14 modals */
+async function pronunciationDialog() {
+  const list = h("div", { class: "small", style: "display:flex;flex-direction:column;gap:.35rem;max-height:16rem;overflow:auto" });
+  const term = h("input", { type: "text", placeholder: "term (as written, e.g. 'GIF')" });
+  const repl = h("input", { type: "text", placeholder: "say-as respelling (e.g. 'jiff')" });
+  const lang = h("input", { type: "text", placeholder: "language ('*' = all)", value: "*", style: "width:7rem" });
+  const testIn = h("input", { type: "text", placeholder: "type a sentence to preview substitutions…" });
+  const testOut = h("div", { class: "small muted" });
+
+  async function refresh() {
+    list.replaceChildren(h("div", { class: "muted", text: "Loading…" }));
+    try {
+      const entries = await api("/api/voicestudio/pronunciation");
+      list.replaceChildren(...(entries.length ? entries.map(e =>
+        h("div", { class: "row", style: "justify-content:space-between" }, [
+          h("span", { html: `<b>${esc(e.term)}</b> → ${esc(e.replacement || "—")} <span class="muted">(${esc(e.type || "respelling")}${e.language && e.language !== "*" ? ", " + esc(e.language) : ""}${e.enabled === false ? ", off" : ""})</span>` }),
+          h("button", { class: "btn btn-sm", text: "🗑", onclick: async () => {
+            await api(`/api/voicestudio/pronunciation/${e.id}`, { method: "DELETE" });
+            toast("Entry deleted", "good"); refresh();
+          } }),
+        ])) : [h("div", { class: "muted", text: "No entries yet — add one below." })]));
+    } catch (e) { list.replaceChildren(h("div", { class: "muted", text: "✗ " + e.message })); }
+  }
+
+  testIn.addEventListener("change", async () => {
+    if (!testIn.value.trim()) return;
+    try {
+      const d = await api("/api/voicestudio/pronunciation/test", { method: "POST", body: { text: testIn.value } });
+      testOut.textContent = "→ " + (d.text || d.output || JSON.stringify(d));
+    } catch (e) { testOut.textContent = "✗ " + e.message; }
+  });
+
+  modal("📖 Pronunciation dictionary", [
+    h("p", { class: "small muted", text: "Synced with VoiceStudio's dictionary — respellings apply to every synthesis (speech, audiobook, dub). Edits here go straight to VoiceStudio; they're NOT stored separately by StickStory." }),
+    list,
+    h("div", { class: "row" }, [term, repl, lang]),
+    h("div", { class: "row" }, [
+      h("button", { class: "btn btn-primary btn-sm", text: "➕ Add entry", onclick: async () => {
+        try {
+          await api("/api/voicestudio/pronunciation", { method: "POST",
+            body: { term: term.value, replacement: repl.value, language: lang.value || "*" } });
+          term.value = ""; repl.value = "";
+          toast("Entry added", "good"); refresh();
+        } catch (e) { toast(e.message, "bad", 6000); }
+      } }),
+    ]),
+    h("div", { class: "field" }, [h("span", { class: "small", text: "Preview substitution" }), testIn, testOut]),
+  ], [h("button", { class: "btn", text: "Close", onclick: () => modalClose() })]);
+  refresh();
+}
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function archetypesDialog() {
+  const q = h("input", { type: "text", placeholder: "search voices… (e.g. 'calm deep narrator')" });
+  const list = h("div", { class: "small", style: "display:flex;flex-direction:column;gap:.4rem;max-height:20rem;overflow:auto" });
+  const info = h("div", { class: "small muted" });
+
+  async function search() {
+    list.replaceChildren(h("div", { class: "muted", text: "Loading…" }));
+    try {
+      const d = await api(`/api/voicestudio/archetypes?q=${encodeURIComponent(q.value.trim())}&limit=24`);
+      info.textContent = d.total != null ? `${d.total} archetypes in catalog (showing ${d.count})` : `${d.count} shown`;
+      list.replaceChildren(...(d.items.length ? d.items.map(a =>
+        h("div", { class: "row", style: "justify-content:space-between;align-items:flex-start" }, [
+          h("div", {}, [
+            h("b", { text: a.name || a.id }),
+            a.instruct ? h("div", { class: "muted", text: String(a.instruct).slice(0, 110) }) : null,
+            a.tags ? h("div", { class: "muted small", text: (a.tags || []).join(" · ") }) : null,
+          ].filter(Boolean)),
+          h("button", { class: "btn btn-primary btn-sm", text: "Use", onclick: async () => {
+            if (!state.settings.vs_license_ack) { toast("Tick the CC-BY-NC acknowledgement in the VoiceStudio card first.", "bad", 6000); return; }
+            try {
+              const r = await api(`/api/voicestudio/archetypes/${a.id}/use`, { method: "POST" });
+              if (r.profile_id) {
+                const f = document.getElementById("vs-voice");
+                if (f) f.value = r.profile_id;
+                toast(`Voice profile ${r.profile_id} created — filled in for you. Save settings.`, "good", 7000);
+              } else toast("Archetype materialized — check VoiceStudio's voice list for the new profile.", "good", 6000);
+              modalClose();
+            } catch (e) { toast(e.message, "bad", 7000); }
+          } }),
+        ])) : [h("div", { class: "muted", text: "No archetypes matched." })]));
+    } catch (e) { list.replaceChildren(h("div", { class: "muted", text: "✗ " + e.message })); }
+  }
+  q.addEventListener("input", () => { clearTimeout(q._t); q._t = setTimeout(search, 350); });
+
+  modal("🎭 Voice archetypes (VoiceStudio catalog)", [
+    h("p", { class: "small muted", text: "Hundreds of built-in voice designs. “Use” materializes one into a reusable voice profile inside VoiceStudio (non-commercial CC-BY-NC applies to stock OmniVoice weights)." }),
+    q, info, list,
+  ], [h("button", { class: "btn", text: "Close", onclick: () => modalClose() })]);
+  search();
+}
+
+async function batchDubDialog() {
+  const file = h("input", { type: "file", accept: "video/*" });
+  const langs = h("input", { type: "text", value: "es", placeholder: "target languages, e.g. es,fr,hi" });
+  const jobs = h("div", { class: "small", style: "max-height:12rem;overflow:auto;display:flex;flex-direction:column;gap:.3rem" });
+
+  async function refreshJobs() {
+    jobs.replaceChildren(h("div", { class: "muted", text: "Loading…" }));
+    try {
+      const d = await api("/api/voicestudio/batch/jobs");
+      jobs.replaceChildren(...(d.length ? d.map(j =>
+        h("div", { class: "muted", text: `#${j.id || j.job_id} — ${j.status || "?"} ${j.langs ? "→ " + j.langs : ""} ${j.progress != null ? Math.round(j.progress * 100) + "%" : ""}` }))
+        : [h("div", { class: "muted", text: "No batch jobs yet." })]));
+    } catch (e) { jobs.replaceChildren(h("div", { class: "muted", text: "✗ " + e.message })); }
+  }
+
+  modal("🌍 Batch video dubbing (VoiceStudio)", [
+    h("p", { class: "small muted", text: "Upload a video and VoiceStudio will transcribe → translate → re-voice it (keeps background audio). Output lives in VoiceStudio — grab it from its UI." }),
+    h("label", { class: "field" }, [h("span", { text: "Video file" }), file]),
+    h("label", { class: "field" }, [h("span", { text: "Languages (comma-separated)" }), langs]),
+    h("h3", { text: "Jobs" }), jobs,
+  ], [
+    h("button", { class: "btn btn-primary", text: "📤 Enqueue dub", onclick: async (ev) => {
+      if (!file.files[0]) { toast("Pick a video first", "bad"); return; }
+      const fd = new FormData();
+      fd.append("langs", langs.value.trim() || "es");
+      fd.append("video", file.files[0]);
+      ev.target.disabled = true; ev.target.textContent = "Uploading…";
+      try {
+        const res = await fetch("/api/voicestudio/batch/enqueue", { method: "POST", body: fd });
+        const d = await res.json().catch(() => null);
+        if (!res.ok || (d && d.ok === false)) throw new Error((d && (d.error || d.detail)) || `HTTP ${res.status}`);
+        const dd = (d && d.data) || d || {};
+        toast(`Batch job ${dd.job_id || dd.id || ""} enqueued`, "good", 6000);
+        refreshJobs();
+      } catch (e) { toast(e.message, "bad", 8000); }
+      ev.target.disabled = false; ev.target.textContent = "📤 Enqueue dub";
+    } }),
+    h("button", { class: "btn", text: "Close", onclick: () => modalClose() }),
+  ]);
+  refreshJobs();
 }

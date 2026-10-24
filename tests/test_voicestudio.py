@@ -90,22 +90,43 @@ def test_private_host_guard():
 def test_speech_contract_and_instructions(monkeypatch):
     calls = {}
 
-    def fake_post(url, json=None, headers=None, timeout=None, stream=False):
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
         calls["url"] = url
         calls["json"] = json
-        return StubResp(200, b"AUDIOBYTES")
+        return StubResp(200, b"AUDIOBYTES" * 32)
 
     import requests
     monkeypatch.setattr(requests, "post", fake_post)
     data, ctype = tts_service._voicestudio_synthesize(
         "Hello world", _vs_settings(narration_style="mystery"),
         instructions=tts_service.NARRATION_INSTRUCTIONS["mystery"])
-    assert data == b"AUDIOBYTES"
-    assert calls["url"] == "http://127.0.0.1:3900/v1/speech"
+    assert data == b"AUDIOBYTES" * 32
+    assert calls["url"] == "http://127.0.0.1:3900/v1/audio/speech"     # OpenAI-compat route
     assert calls["json"]["voice"] == "default"          # blank profile -> 'default'
-    assert calls["json"]["engine_id"] == "omnivoice"
+    assert calls["json"]["model"] == "omnivoice"        # engine maps to 'model'
+    assert calls["json"]["response_format"] == "mp3"
     assert "Hushed" in calls["json"]["instructions"]    # acting instruction lands
     print("PASS 4/9 SpeechRequest contract + acting instructions")
+
+
+def test_speech_legacy_fallback(monkeypatch):
+    """A build without /v1/audio/speech (404) should fall back to /generate."""
+    calls = []
+
+    def fake_post(url, json=None, data=None, headers=None, timeout=None, **kw):
+        calls.append(url)
+        if url.endswith("/v1/audio/speech"):
+            return StubResp(404, b"not found")
+        if url.endswith("/generate"):
+            assert data and data.get("text") == "hi there"
+            return StubResp(200, b"LEGACYAUDIO" * 32)
+        raise AssertionError(f"unexpected url {url}")
+
+    import requests
+    monkeypatch.setattr(requests, "post", fake_post)
+    data, _ = tts_service._voicestudio_synthesize("hi there", _vs_settings())
+    assert data == b"LEGACYAUDIO" * 32 and any(u.endswith("/generate") for u in calls)
+    print("PASS 4b legacy /generate fallback on 404")
 
 
 # --------------------------------------------------------------------- 5
@@ -166,11 +187,11 @@ def test_license_gate_and_fallback(monkeypatch):
 def test_clone_multipart(monkeypatch, tmp_path):
     got = {}
 
-    def fake_post(url, files=None, data=None, headers=None, timeout=None):
+    def fake_post(url, files=None, data=None, headers=None, timeout=None, **kw):
         got["url"] = url
         got["data"] = data
         got["files"] = list(files.keys())
-        return StubResp(200, json_body={"id": "voice-42"})
+        return StubResp(200, json_body={"profile": {"id": "voice-42"}})
 
     import requests
     monkeypatch.setattr(requests, "post", fake_post)
@@ -179,9 +200,116 @@ def test_clone_multipart(monkeypatch, tmp_path):
     out = tts_service.voicestudio_clone_voice("My Voice", ref, "hello world",
                                               _vs_settings())
     assert out["id"] == "voice-42"
-    assert got["url"] == "http://127.0.0.1:3900/v1/voices"
+    assert got["url"] == "http://127.0.0.1:3900/profiles"             # spec route
     assert got["data"]["kind"] == "clone" and "ref_audio" in got["files"]
     print("PASS 8/9 clone upload → profile id")
+
+
+# ------------------------------------------------------------- new in v14
+def test_pronunciation_crud_and_preview(monkeypatch):
+    import requests
+    store = {"1": {"id": "1", "term": "GIF", "replacement": "jiff",
+                   "type": "respelling", "language": "*", "enabled": True}}
+
+    def fake_get(url, headers=None, params=None, timeout=None, **kw):
+        if url.endswith("/pronunciation"):
+            return StubResp(200, json_body={"entries": list(store.values())})
+        raise AssertionError(url)
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        if url.endswith("/pronunciation"):
+            entry = {"id": "2", **json}
+            store["2"] = entry
+            return StubResp(200, json_body=entry)
+        if url.endswith("/pronunciation/test"):
+            return StubResp(200, json_body={"text": json["text"].replace("GIF", "jiff")})
+        raise AssertionError(url)
+
+    def fake_put(url, json=None, headers=None, timeout=None, **kw):
+        assert url.endswith("/pronunciation/2")
+        store["2"].update(json)
+        return StubResp(200, json_body=store["2"])
+
+    def fake_delete(url, headers=None, timeout=None, **kw):
+        assert url.endswith("/pronunciation/2")
+        store.pop("2")
+        return StubResp(200, json_body={"ok": True})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests, "put", fake_put)
+    monkeypatch.setattr(requests, "delete", fake_delete)
+
+    s = _vs_settings()
+    entries = tts_service.voicestudio_pronunciation_list(s)
+    assert entries[0]["term"] == "GIF"
+    tts_service.voicestudio_pronunciation_add(s, "SQL", "sequel")
+    assert store["2"]["term"] == "SQL" and store["2"]["type"] == "respelling"
+    tts_service.voicestudio_pronunciation_update(s, "2", replacement="S-Q-L")
+    assert store["2"]["replacement"] == "S-Q-L"
+    out = tts_service.voicestudio_pronunciation_test(s, "I say GIF loudly")
+    assert "jiff" in out["text"]
+    tts_service.voicestudio_pronunciation_delete(s, "2")
+    assert "2" not in store
+    print("PASS 10 pronunciation CRUD + substitution preview")
+
+
+def test_archetypes_and_use(monkeypatch):
+    import requests
+
+    def fake_get(url, headers=None, params=None, timeout=None, **kw):
+        assert url.endswith("/archetypes")
+        assert params["q"] == "calm" and params["limit"] == 5
+        return StubResp(200, json_body={"items": [{"id": "arch-1", "name": "Calm Narrator"}],
+                                        "total": 1})
+
+    def fake_post(url, headers=None, timeout=None, **kw):
+        assert url.endswith("/archetypes/arch-1/use")
+        return StubResp(200, json_body={"profile_id": "vp-99"})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(requests, "post", fake_post)
+    s = _vs_settings()
+    out = tts_service.voicestudio_archetypes(s, q="calm", limit=5)
+    assert out["items"][0]["id"] == "arch-1"
+    res = tts_service.voicestudio_archetype_use(s, "arch-1")
+    assert res["profile_id"] == "vp-99"
+    print("PASS 11 archetypes browse + materialize")
+
+
+def test_audiobook_and_jobs(monkeypatch):
+    import requests
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        assert url.endswith("/audiobook")
+        assert json["default_voice"] == "vp-7" and json["format"] == "mp3"
+        return StubResp(200, json_body={"job_id": "ab-1", "status": "done"})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    s = _vs_settings(vs_voice_profile_id="vp-7")
+    out = tts_service.voicestudio_audiobook(s, "chapter text " * 100, title="My Show")
+    assert out["job_id"] == "ab-1"
+    print("PASS 12 audiobook longform submit")
+
+
+def test_batch_enqueue(monkeypatch, tmp_path):
+    import requests
+    got = {}
+
+    def fake_post(url, files=None, data=None, headers=None, timeout=None, **kw):
+        got["url"] = url
+        got["data"] = data
+        got["files"] = list(files.keys())
+        return StubResp(200, json_body={"job_id": "bj-1"})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"FAKEMP4")
+    out = tts_service.voicestudio_batch_enqueue(_vs_settings(), vid, langs="es,fr")
+    assert out["job_id"] == "bj-1"
+    assert got["url"].endswith("/batch/enqueue")
+    assert got["data"]["langs"] == "es,fr" and "video" in got["files"]
+    print("PASS 13 batch dub enqueue")
 
 
 # --------------------------------------------------------------------- 9
@@ -194,9 +322,12 @@ def test_narration_styles_complete():
 
 
 ALL = [test_secrets_masked_public, test_header_auth_only, test_private_host_guard,
-       test_speech_contract_and_instructions, test_chunking_respects_4096,
+       test_speech_contract_and_instructions, test_speech_legacy_fallback,
+       test_chunking_respects_4096,
        test_retry_after_error, test_license_gate_and_fallback,
-       test_clone_multipart, test_narration_styles_complete]
+       test_clone_multipart, test_narration_styles_complete,
+       test_pronunciation_crud_and_preview, test_archetypes_and_use,
+       test_audiobook_and_jobs, test_batch_enqueue]
 
 
 class _MonkeyPatch:
